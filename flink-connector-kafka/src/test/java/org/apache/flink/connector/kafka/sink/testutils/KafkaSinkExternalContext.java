@@ -106,9 +106,38 @@ public class KafkaSinkExternalContext implements DataStreamSinkV2ExternalContext
         NewTopic newTopic = new NewTopic(topicName, numPartitions, replicationFactor);
         try {
             kafkaAdminClient.createTopics(Collections.singletonList(newTopic)).all().get();
+            // Wait for topic metadata to propagate to avoid race conditions where subsequent
+            // operations fail because the topic is not yet visible in metadata.
+            // This is particularly important in CI environments where Kafka may be under load.
+            waitForTopicMetadata(topicName, 30000);
         } catch (Exception e) {
             throw new RuntimeException(String.format("Cannot create topic '%s'", topicName), e);
         }
+    }
+
+    private void waitForTopicMetadata(String topicName, long timeoutMs) throws Exception {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        Exception lastException = null;
+
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                // Try to fetch topic metadata
+                kafkaAdminClient
+                        .describeTopics(Collections.singletonList(topicName))
+                        .allTopicNames()
+                        .get();
+                LOG.debug("Topic {} is now available in metadata", topicName);
+                return;
+            } catch (Exception e) {
+                lastException = e;
+                Thread.sleep(100); // Wait 100ms before retry
+            }
+        }
+
+        throw new RuntimeException(
+                String.format(
+                        "Topic '%s' not available in metadata after %d ms", topicName, timeoutMs),
+                lastException);
     }
 
     private void deleteTopic(String topicName) {
