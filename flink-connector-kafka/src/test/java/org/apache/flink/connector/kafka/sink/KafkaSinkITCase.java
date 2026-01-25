@@ -180,7 +180,7 @@ public class KafkaSinkITCase {
     }
 
     @AfterEach
-    public void tearDown() throws ExecutionException, InterruptedException, TimeoutException {
+    void tearDown() throws ExecutionException, InterruptedException, TimeoutException {
         checkProducerLeak();
         deleteTestTopic(topic);
     }

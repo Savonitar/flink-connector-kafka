@@ -22,6 +22,7 @@ import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.metrics.groups.SinkWriterMetricGroup;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.test.junit5.MiniClusterExtension;
+import org.apache.flink.util.TestLoggerExtension;
 
 import org.apache.kafka.common.errors.NetworkException;
 import org.apache.kafka.common.errors.TimeoutException;
@@ -55,7 +56,7 @@ public class KafkaWriterFaultToleranceITCase extends KafkaWriterTestBase {
                             .build());
 
     @Test
-    public void testWriteExceptionWhenKafkaUnavailable() throws Exception {
+    void testWriteExceptionWhenKafkaUnavailable() throws Exception {
         final SinkWriterMetricGroup metricGroup = createSinkWriterMetricGroup();
 
         try (KafkaWriter<Integer> writer =
@@ -79,7 +80,7 @@ public class KafkaWriterFaultToleranceITCase extends KafkaWriterTestBase {
     }
 
     @Test
-    public void testFlushExceptionWhenKafkaUnavailable() throws Exception {
+    void testFlushExceptionWhenKafkaUnavailable() throws Exception {
         final SinkWriterMetricGroup metricGroup = createSinkWriterMetricGroup();
 
         try (KafkaWriter<Integer> writer =
@@ -100,7 +101,7 @@ public class KafkaWriterFaultToleranceITCase extends KafkaWriterTestBase {
     }
 
     @Test
-    public void testCloseExceptionWhenKafkaUnavailable() throws Exception {
+    void testCloseExceptionWhenKafkaUnavailable() throws Exception {
         final SinkWriterMetricGroup metricGroup = createSinkWriterMetricGroup();
 
         KafkaWriter<Integer> writer =
@@ -127,7 +128,7 @@ public class KafkaWriterFaultToleranceITCase extends KafkaWriterTestBase {
     }
 
     @Test
-    public void testMailboxExceptionWhenKafkaUnavailable() throws Exception {
+    void testMailboxAsyncErrorPropagationAndErrorCounter() throws Exception {
         SinkInitContext sinkInitContext =
                 new SinkInitContext(createSinkWriterMetricGroup(), timeService, null);
 

@@ -20,6 +20,7 @@ package org.apache.flink.streaming.connectors.kafka.internals.metrics;
 
 import org.apache.flink.connector.kafka.testutils.TestKafkaContainer;
 import org.apache.flink.metrics.Gauge;
+import org.apache.flink.util.TestLoggerExtension;
 
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -43,7 +44,7 @@ import static org.apache.flink.connector.kafka.testutils.KafkaUtil.createKafkaCo
 
 @ExtendWith(TestLoggerExtension.class)
 @Testcontainers
-public class KafkaMetricMutableWrapperTest {
+class KafkaMetricMutableWrapperTest {
 
     private static final String INTER_CONTAINER_KAFKA_ALIAS = "kafka";
     private static final Network NETWORK = Network.newNetwork();
@@ -55,7 +56,7 @@ public class KafkaMetricMutableWrapperTest {
                     .withNetworkAliases(INTER_CONTAINER_KAFKA_ALIAS);
 
     @Test
-    public void testOnlyMeasurableMetricsAreRegisteredWithMutableWrapper() {
+    void testOnlyMeasurableMetricsAreRegisteredWithMutableWrapper() {
         testOnlyMeasurableMetricsAreRegistered(KafkaMetricMutableWrapper::new);
     }
 

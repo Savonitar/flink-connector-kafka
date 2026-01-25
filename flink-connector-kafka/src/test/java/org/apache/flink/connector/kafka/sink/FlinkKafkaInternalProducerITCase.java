@@ -22,6 +22,7 @@ import org.apache.flink.connector.kafka.sink.internal.FlinkKafkaInternalProducer
 import org.apache.flink.connector.kafka.testutils.TestKafkaContainer;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.test.junit5.MiniClusterExtension;
+import org.apache.flink.util.TestLoggerExtension;
 
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
@@ -60,7 +61,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @ExtendWith(TestLoggerExtension.class)
 @Testcontainers
-public class FlinkKafkaInternalProducerITCase {
+class FlinkKafkaInternalProducerITCase {
 
     @RegisterExtension
     public static final MiniClusterExtension MINI_CLUSTER_RESOURCE =
@@ -81,7 +82,7 @@ public class FlinkKafkaInternalProducerITCase {
     }
 
     @Test
-    public void testResetTransactional() {
+    void testResetTransactional() {
         final String topic = "test-init-transactions";
         final String transactionIdPrefix = "testInitTransactionId-";
         try (FlinkKafkaInternalProducer<String, String> reuse =
@@ -105,7 +106,7 @@ public class FlinkKafkaInternalProducerITCase {
     }
 
     @Test
-    public void testCommitResumedTransaction() {
+    void testCommitResumedTransaction() {
         final String topic = "test-commit-resumed-transaction";
         final String transactionIdPrefix = "testCommitResumedTransaction-";
         final String transactionalId = transactionIdPrefix + "id";
@@ -132,7 +133,7 @@ public class FlinkKafkaInternalProducerITCase {
     }
 
     @Test
-    public void testCommitResumedEmptyTransactionShouldFail() {
+    void testCommitResumedEmptyTransactionShouldFail() {
         KafkaCommittable snapshottedCommittable;
         try (FlinkKafkaInternalProducer<String, String> producer =
                 new FlinkKafkaInternalProducer<>(getProperties(), "dummy")) {

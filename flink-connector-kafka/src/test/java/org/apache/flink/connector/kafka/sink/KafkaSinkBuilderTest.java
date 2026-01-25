@@ -42,7 +42,7 @@ public class KafkaSinkBuilderTest {
             };
 
     @Test
-    public void testPropertyHandling() {
+    void testPropertyHandling() {
         validateProducerConfig(
                 getBasicBuilder(),
                 p -> {
@@ -78,7 +78,7 @@ public class KafkaSinkBuilderTest {
     }
 
     @Test
-    public void testBootstrapServerSetting() {
+    void testBootstrapServerSetting() {
         Properties testConf1 = new Properties();
         testConf1.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "testServer");
 
@@ -88,7 +88,7 @@ public class KafkaSinkBuilderTest {
     }
 
     @Test
-    public void testTransactionalIdSanityCheck() {
+    void testTransactionalIdSanityCheck() {
         assertThatThrownBy(
                         () ->
                                 getBasicBuilder()

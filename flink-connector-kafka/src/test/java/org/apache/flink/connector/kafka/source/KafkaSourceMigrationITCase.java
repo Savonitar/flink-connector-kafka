@@ -90,13 +90,13 @@ public class KafkaSourceMigrationITCase {
     private static final SharedObjectsExtension SHARED_OBJECTS = SharedObjectsExtension.create();
 
     @BeforeEach
-    public void setupEnv() throws Throwable {
+    void setupEnv() throws Throwable {
         // restarting Kafka with each migration test because we use the same topic underneath
         KafkaSourceTestEnv.setup();
     }
 
     @AfterEach
-    public void removeEnv() throws Exception {
+    void removeEnv() throws Exception {
         KafkaSourceTestEnv.tearDown();
     }
 
@@ -113,7 +113,7 @@ public class KafkaSourceMigrationITCase {
 
     @Disabled("Enable if you want to create savepoint of KafkaSource")
     @Test
-    public void createAndStoreSavepoint(
+    void createAndStoreSavepoint(
             @InjectClusterClient ClusterClient<?> clusterClient,
             @InjectMiniCluster MiniCluster miniCluster)
             throws Throwable {

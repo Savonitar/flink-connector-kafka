@@ -31,6 +31,7 @@ import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.groups.SinkWriterMetricGroup;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.test.junit5.MiniClusterExtension;
+import org.apache.flink.util.TestLoggerExtension;
 
 import com.google.common.collect.Iterables;
 import org.apache.kafka.clients.admin.AdminClient;
@@ -73,7 +74,7 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
             sink -> sink.setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE);
 
     @Test
-    public void testFlushAsyncErrorPropagationAndErrorCounter() throws Exception {
+    void testFlushAsyncErrorPropagationAndErrorCounter() throws Exception {
         Properties properties = getKafkaClientConfiguration();
 
         final SinkWriterMetricGroup metricGroup = createSinkWriterMetricGroup();
@@ -102,7 +103,7 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
     }
 
     @Test
-    public void testWriteAsyncErrorPropagationAndErrorCounter() throws Exception {
+    void testWriteAsyncErrorPropagationAndErrorCounter() throws Exception {
         Properties properties = getKafkaClientConfiguration();
 
         final SinkWriterMetricGroup metricGroup = createSinkWriterMetricGroup();
@@ -132,7 +133,7 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
     }
 
     @Test
-    public void testMailboxAsyncErrorPropagationAndErrorCounter() throws Exception {
+    void testMailboxAsyncErrorPropagationAndErrorCounter() throws Exception {
         Properties properties = getKafkaClientConfiguration();
 
         SinkInitContext sinkInitContext =
@@ -168,7 +169,7 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
     }
 
     @Test
-    public void testCloseAsyncErrorPropagationAndErrorCounter() throws Exception {
+    void testCloseAsyncErrorPropagationAndErrorCounter() throws Exception {
         Properties properties = getKafkaClientConfiguration();
 
         final SinkWriterMetricGroup metricGroup = createSinkWriterMetricGroup();
@@ -208,7 +209,7 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
 
     /** Test that producer is not accidentally recreated or pool is used. */
     @Test
-    public void shouldAbortLingeringTransactions() throws Exception {
+    void shouldAbortLingeringTransactions() throws Exception {
         try (final ExactlyOnceKafkaWriter<Integer> failedWriter =
                 createWriter(DeliveryGuarantee.EXACTLY_ONCE)) {
 
@@ -327,7 +328,7 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
      * producer.
      */
     @Test
-    public void prepareCommitForEmptyTransaction() throws Exception {
+    void prepareCommitForEmptyTransaction() throws Exception {
         try (final ExactlyOnceKafkaWriter<Integer> writer =
                 createWriter(DeliveryGuarantee.EXACTLY_ONCE)) {
             assertThat(getProducers(writer)).hasSize(0);
@@ -349,7 +350,7 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
      * succeed.
      */
     @Test
-    public void testAbortOnClose() throws Exception {
+    void testAbortOnClose() throws Exception {
         Properties properties = getKafkaClientConfiguration();
         try (final KafkaWriter<Integer> writer = createWriter(DeliveryGuarantee.EXACTLY_ONCE)) {
             writer.write(1, SINK_WRITER_CONTEXT);
@@ -378,7 +379,7 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
 
     /** Test that producers are reused when committed. */
     @Test
-    public void shouldSkipIdsOfCommitterForPooledTransactions() throws Exception {
+    void shouldSkipIdsOfCommitterForPooledTransactions() throws Exception {
         String prefix = getTransactionalPrefix();
         CheckpointTransaction t1 = new CheckpointTransaction(buildTransactionalId(prefix, 0, 2), 2);
         CheckpointTransaction t2 = new CheckpointTransaction(buildTransactionalId(prefix, 0, 4), 4);

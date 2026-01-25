@@ -22,6 +22,7 @@ import org.apache.flink.connector.kafka.sink.KafkaTransactionLog.TransactionReco
 import org.apache.flink.connector.kafka.testutils.TestKafkaContainer;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.test.junit5.MiniClusterExtension;
+import org.apache.flink.util.TestLoggerExtension;
 
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
@@ -54,7 +55,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /** Tests for {@link KafkaTransactionLog} to retrieve abortable Kafka transactions. */
 @ExtendWith(TestLoggerExtension.class)
 @Testcontainers
-public class KafkaTransactionLogITCase {
+class KafkaTransactionLogITCase {
 
     private static final String TOPIC_NAME = "kafkaTransactionLogTest";
     private static final String TRANSACTIONAL_ID_PREFIX = "kafka-log";
@@ -75,7 +76,7 @@ public class KafkaTransactionLogITCase {
     private final List<Producer<byte[], Integer>> openProducers = new ArrayList<>();
 
     @AfterEach
-    public void tearDown() {
+    void tearDown() {
         openProducers.forEach(Producer::close);
         checkProducerLeak();
     }
