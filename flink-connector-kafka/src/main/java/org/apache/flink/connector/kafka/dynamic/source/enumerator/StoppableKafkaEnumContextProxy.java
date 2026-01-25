@@ -106,7 +106,39 @@ public class StoppableKafkaEnumContextProxy
 
     @Override
     public void sendEventToSourceReader(int subtaskId, SourceEvent event) {
-        enumContext.sendEventToSourceReader(subtaskId, event);
+        // Check if the reader is still registered before sending the event.
+        // In race conditions (e.g., testIdleReader), some readers may finish early
+        // while the coordinator is still coordinating across all clusters.
+        // Attempting to send events to finished readers would cause TaskNotRunningException.
+        if (!registeredReaders().containsKey(subtaskId)) {
+            logger.debug(
+                    "Skipping event {} to subtask {} for cluster {} because reader is no longer registered. "
+                            + "This is expected when readers finish early in multi-cluster scenarios.",
+                    event,
+                    subtaskId,
+                    kafkaClusterId);
+            return;
+        }
+
+        try {
+            enumContext.sendEventToSourceReader(subtaskId, event);
+        } catch (Exception e) {
+            // Even with the check above, there's still a tiny race window where a reader
+            // could finish between the check and the send. Handle that gracefully.
+            if (ExceptionUtils.findThrowableWithMessage(e, "not running").isPresent()
+                    || ExceptionUtils.findThrowableWithMessage(e, "FINISHED").isPresent()) {
+                logger.debug(
+                        "Failed to send event {} to subtask {} for cluster {} because task finished "
+                                + "between registration check and event send.",
+                        event,
+                        subtaskId,
+                        kafkaClusterId,
+                        e);
+            } else {
+                // Re-throw any unexpected errors - we only handle the known race condition
+                throw e;
+            }
+        }
     }
 
     @Override
