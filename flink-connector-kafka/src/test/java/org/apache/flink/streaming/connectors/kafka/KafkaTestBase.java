@@ -30,24 +30,25 @@ import org.apache.flink.test.util.SuccessException;
 import org.apache.flink.testutils.junit.RetryOnFailure;
 import org.apache.flink.testutils.junit.RetryRule;
 import org.apache.flink.util.InstantiationUtil;
-import org.apache.flink.util.TestLogger;
+import org.apache.flink.util.TestLoggerExtension;
 
 import com.google.common.base.MoreObjects;
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
-import org.junit.ClassRule;
-import org.junit.Rule;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.parallel.ResourceLock;
-import org.junit.rules.TemporaryFolder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -74,11 +75,12 @@ import java.util.concurrent.atomic.AtomicReference;
 @SuppressWarnings("serial")
 @RetryOnFailure(times = 3)
 @ResourceLock("KafkaTestBase")
-public abstract class KafkaTestBase extends TestLogger {
+@ExtendWith(TestLoggerExtension.class)
+public abstract class KafkaTestBase {
 
-    public static final Logger LOG = LoggerFactory.getLogger(KafkaTestBase.class);
+    static final Logger LOG = LoggerFactory.getLogger(KafkaTestBase.class);
 
-    public static final int NUMBER_OF_KAFKA_SERVERS = 1;
+    static final int NUMBER_OF_KAFKA_SERVERS = 1;
     private static int numKafkaClusters = 1;
 
     public static String brokerConnectionStrings;
@@ -89,17 +91,17 @@ public abstract class KafkaTestBase extends TestLogger {
 
     public static List<KafkaClusterTestEnvMetadata> kafkaClusters = new ArrayList<>();
 
-    @ClassRule public static TemporaryFolder tempFolder = new TemporaryFolder();
+    @TempDir public static File tempFolder;
 
     public static Properties secureProps = new Properties();
 
-    @Rule public final RetryRule retryRule = new RetryRule();
+    @RegisterExtension public final RetryRule retryRule = new RetryRule();
 
     // ------------------------------------------------------------------------
     //  Setup and teardown of the mini clusters
     // ------------------------------------------------------------------------
 
-    @BeforeClass
+    @BeforeAll
     public static void prepare() throws Exception {
         LOG.info("-------------------------------------------------------------------------");
         LOG.info("    Starting KafkaTestBase ");
@@ -108,7 +110,7 @@ public abstract class KafkaTestBase extends TestLogger {
         startClusters(false, numKafkaClusters);
     }
 
-    @AfterClass
+    @AfterAll
     public static void shutDownServices() throws Exception {
 
         LOG.info("-------------------------------------------------------------------------");
@@ -124,7 +126,7 @@ public abstract class KafkaTestBase extends TestLogger {
         LOG.info("-------------------------------------------------------------------------");
     }
 
-    public static Configuration getFlinkConfiguration() {
+    static Configuration getFlinkConfiguration() {
         Configuration flinkConfig = new Configuration();
         flinkConfig.set(TaskManagerOptions.MANAGED_MEMORY_SIZE, MemorySize.parse("16m"));
         MetricOptions.forReporter(flinkConfig, "my_reporter")
@@ -132,18 +134,18 @@ public abstract class KafkaTestBase extends TestLogger {
         return flinkConfig;
     }
 
-    public static void startClusters() throws Exception {
+    static void startClusters() throws Exception {
         startClusters(
                 KafkaTestEnvironment.createConfig().setKafkaServersNumber(NUMBER_OF_KAFKA_SERVERS));
     }
 
-    public static void startClusters(boolean secureMode, int numKafkaClusters) throws Exception {
+    static void startClusters(boolean secureMode, int numKafkaClusters) throws Exception {
         startClusters(
                 KafkaTestEnvironment.createConfig().setSecureMode(secureMode), numKafkaClusters);
     }
 
-    public static void startClusters(
-            KafkaTestEnvironment.Config environmentConfig, int numKafkaClusters) throws Exception {
+    static void startClusters(KafkaTestEnvironment.Config environmentConfig, int numKafkaClusters)
+            throws Exception {
         for (int i = 0; i < numKafkaClusters; i++) {
             startClusters(environmentConfig);
             KafkaClusterTestEnvMetadata kafkaClusterTestEnvMetadata =
@@ -154,8 +156,7 @@ public abstract class KafkaTestBase extends TestLogger {
         }
     }
 
-    public static void startClusters(KafkaTestEnvironment.Config environmentConfig)
-            throws Exception {
+    static void startClusters(KafkaTestEnvironment.Config environmentConfig) throws Exception {
         kafkaServer = constructKafkaTestEnvironment();
 
         LOG.info("Starting KafkaTestBase.prepare() for Kafka {}", kafkaServer.getVersion());
@@ -175,14 +176,14 @@ public abstract class KafkaTestBase extends TestLogger {
         }
     }
 
-    public static KafkaTestEnvironment constructKafkaTestEnvironment() throws Exception {
+    static KafkaTestEnvironment constructKafkaTestEnvironment() throws Exception {
         Class<?> clazz =
                 Class.forName(
                         "org.apache.flink.streaming.connectors.kafka.KafkaTestEnvironmentImpl");
         return (KafkaTestEnvironment) InstantiationUtil.instantiate(clazz);
     }
 
-    public static void shutdownClusters() throws Exception {
+    static void shutdownClusters() throws Exception {
         if (secureProps != null) {
             secureProps.clear();
         }
@@ -203,7 +204,7 @@ public abstract class KafkaTestBase extends TestLogger {
     //  Execution utilities
     // ------------------------------------------------------------------------
 
-    public static void tryExecutePropagateExceptions(StreamExecutionEnvironment see, String name)
+    static void tryExecutePropagateExceptions(StreamExecutionEnvironment see, String name)
             throws Exception {
         try {
             see.execute(name);
@@ -274,7 +275,7 @@ public abstract class KafkaTestBase extends TestLogger {
         }
     }
 
-    public static void setNumKafkaClusters(int size) {
+    static void setNumKafkaClusters(int size) {
         numKafkaClusters = size;
     }
 

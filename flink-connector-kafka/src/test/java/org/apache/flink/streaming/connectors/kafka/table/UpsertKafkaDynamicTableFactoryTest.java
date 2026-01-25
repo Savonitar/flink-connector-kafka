@@ -68,13 +68,10 @@ import org.apache.flink.table.types.AtomicDataType;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.VarCharType;
-import org.apache.flink.util.TestLogger;
 
 import org.apache.kafka.clients.consumer.OffsetAndTimestamp;
 import org.apache.kafka.common.TopicPartition;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.ExpectedException;
+import org.junit.jupiter.api.Test;
 
 import javax.annotation.Nullable;
 
@@ -98,7 +95,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link UpsertKafkaDynamicTableFactory}. */
-public class UpsertKafkaDynamicTableFactoryTest extends TestLogger {
+public class UpsertKafkaDynamicTableFactoryTest {
 
     private static final String SOURCE_TOPIC = "sourceTopic_1";
 
@@ -156,8 +153,6 @@ public class UpsertKafkaDynamicTableFactoryTest extends TestLogger {
     static DecodingFormat<DeserializationSchema<RowData>> valueDecodingFormat =
             new TestFormatFactory.DecodingFormatMock(
                     ",", true, ChangelogMode.insertOnly(), Collections.emptyMap());
-
-    @Rule public ExpectedException thrown = ExpectedException.none();
 
     @Test
     public void testTableSource() {

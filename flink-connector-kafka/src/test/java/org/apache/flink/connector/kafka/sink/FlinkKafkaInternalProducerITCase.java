@@ -22,7 +22,6 @@ import org.apache.flink.connector.kafka.sink.internal.FlinkKafkaInternalProducer
 import org.apache.flink.connector.kafka.testutils.TestKafkaContainer;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.test.junit5.MiniClusterExtension;
-import org.apache.flink.util.TestLoggerExtension;
 
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
@@ -59,9 +58,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-@Testcontainers
 @ExtendWith(TestLoggerExtension.class)
-class FlinkKafkaInternalProducerITCase {
+@Testcontainers
+public class FlinkKafkaInternalProducerITCase {
 
     @RegisterExtension
     public static final MiniClusterExtension MINI_CLUSTER_RESOURCE =
@@ -82,7 +81,7 @@ class FlinkKafkaInternalProducerITCase {
     }
 
     @Test
-    void testResetTransactional() {
+    public void testResetTransactional() {
         final String topic = "test-init-transactions";
         final String transactionIdPrefix = "testInitTransactionId-";
         try (FlinkKafkaInternalProducer<String, String> reuse =
@@ -106,7 +105,7 @@ class FlinkKafkaInternalProducerITCase {
     }
 
     @Test
-    void testCommitResumedTransaction() {
+    public void testCommitResumedTransaction() {
         final String topic = "test-commit-resumed-transaction";
         final String transactionIdPrefix = "testCommitResumedTransaction-";
         final String transactionalId = transactionIdPrefix + "id";
@@ -133,7 +132,7 @@ class FlinkKafkaInternalProducerITCase {
     }
 
     @Test
-    void testCommitResumedEmptyTransactionShouldFail() {
+    public void testCommitResumedEmptyTransactionShouldFail() {
         KafkaCommittable snapshottedCommittable;
         try (FlinkKafkaInternalProducer<String, String> producer =
                 new FlinkKafkaInternalProducer<>(getProperties(), "dummy")) {

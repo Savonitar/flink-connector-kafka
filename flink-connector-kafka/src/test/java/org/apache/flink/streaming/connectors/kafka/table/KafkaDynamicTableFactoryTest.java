@@ -72,12 +72,11 @@ import org.apache.flink.table.runtime.connector.sink.SinkRuntimeProviderContext;
 import org.apache.flink.table.runtime.connector.source.ScanRuntimeProviderContext;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
-import org.apache.flink.util.TestLoggerExtension;
 
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.OffsetAndTimestamp;
 import org.apache.kafka.common.TopicPartition;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.NullSource;
@@ -473,7 +472,7 @@ public class KafkaDynamicTableFactoryTest {
     @ParameterizedTest
     @ValueSource(strings = {"none", "earliest", "latest"})
     @NullSource
-    public void testTableSourceSetOffsetReset(final String strategyName) {
+    void testTableSourceSetOffsetReset(final String strategyName) {
         testSetOffsetResetForStartFromGroupOffsets(strategyName);
     }
 
