@@ -56,7 +56,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.AssertionsForClassTypes.assertThatCode;
 
 /** Tests for the standalone KafkaWriter. */
-public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
+class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
 
     @RegisterExtension
     public static final MiniClusterExtension MINI_CLUSTER_RESOURCE =

@@ -42,7 +42,7 @@ import java.util.stream.IntStream;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for the standalone KafkaWriter. */
-public class KafkaWriterITCase extends KafkaWriterTestBase {
+class KafkaWriterITCase extends KafkaWriterTestBase {
 
     @RegisterExtension
     public static final MiniClusterExtension MINI_CLUSTER_RESOURCE =
@@ -69,7 +69,7 @@ public class KafkaWriterITCase extends KafkaWriterTestBase {
     }
 
     @Test
-    public void testIncreasingRecordBasedCounters() throws Exception {
+    void testIncreasingRecordBasedCounters() throws Exception {
         final SinkWriterMetricGroup metricGroup = createSinkWriterMetricGroup();
 
         try (final KafkaWriter<Integer> writer =
@@ -111,7 +111,7 @@ public class KafkaWriterITCase extends KafkaWriterTestBase {
     }
 
     @Test
-    public void testCurrentSendTimeMetric() throws Exception {
+    void testCurrentSendTimeMetric() throws Exception {
         try (final KafkaWriter<Integer> writer = createWriter(DeliveryGuarantee.AT_LEAST_ONCE)) {
             final Optional<Gauge<Long>> currentSendTime =
                     metricListener.getGauge("currentSendTime");
@@ -136,7 +136,7 @@ public class KafkaWriterITCase extends KafkaWriterTestBase {
     }
 
     @Test
-    public void testMetadataPublisher() throws Exception {
+    void testMetadataPublisher() throws Exception {
         List<String> metadataList = new ArrayList<>();
         SinkWriterMetricGroup sinkWriterMetricGroup = createSinkWriterMetricGroup();
         try (final KafkaWriter<Integer> writer =

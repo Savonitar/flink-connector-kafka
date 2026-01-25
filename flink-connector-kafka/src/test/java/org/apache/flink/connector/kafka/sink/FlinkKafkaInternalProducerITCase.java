@@ -74,7 +74,7 @@ class FlinkKafkaInternalProducerITCase {
             createKafkaContainer(FlinkKafkaInternalProducerITCase.class);
 
     @AfterEach
-    public void check() {
+    void check() {
         checkProducerLeak();
     }
 
