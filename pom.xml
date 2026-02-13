@@ -102,6 +102,7 @@ under the License.
 		of entries in the form '[-]{2}add-[opens|exports]=<module>/<package>=ALL-UNNAMED'.-->
 		<flink.connector.module.config/>
 		<flink.surefire.baseArgLine>-XX:+UseG1GC -Xms256m -XX:+IgnoreUnrecognizedVMOptions
+			-Dapi.version=1.44
 		${flink.connector.module.config}
 		</flink.surefire.baseArgLine>
 	</properties>
