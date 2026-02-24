@@ -18,6 +18,7 @@
 
 package org.apache.flink.streaming.connectors.kafka.table;
 
+import org.apache.flink.formats.json.JsonParseException;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.Schema;
 import org.apache.flink.table.api.Table;
@@ -28,6 +29,7 @@ import org.apache.flink.types.RowUtils;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
@@ -54,6 +56,7 @@ import static org.apache.flink.streaming.connectors.kafka.table.KafkaTableTestUt
 import static org.apache.flink.table.planner.factories.TestValuesTableFactory.changelogRow;
 import static org.apache.flink.table.utils.TableTestMatchers.deepEqualTo;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.HamcrestCondition.matching;
 
 /** Upsert-kafka IT cases. */
@@ -661,6 +664,87 @@ class UpsertKafkaTableITCase extends KafkaTableTestBase {
 
         // ------------- cleanup -------------------
 
+        deleteTestTopic(topic);
+    }
+
+    @Test
+    void testProjectionPushdownWithJsonFormatAndBreakingSchemaChange() throws Exception {
+        // Only self-contained formats like JSON can use projection pushdown to
+        // avoid deserializing fields that aren't needed for a query and thus avoid
+        // errors from breaking schema changes.
+        final String format = "json";
+
+        // Setup data
+
+        final String topic = "testProjectionPushdown_" + format + "_" + UUID.randomUUID();
+        createTestTopic(topic, 1, 1);
+
+        String bootstraps = getBootstrapServers();
+
+        final String originalCreateTable =
+                String.format(
+                        "CREATE TABLE upsert_kafka (\n"
+                                + "  `user_id` BIGINT,\n"
+                                + "  `name` INT,\n" // `name` is originally an INT field
+                                + "  `payload` STRING,\n"
+                                + "  PRIMARY KEY (user_id) NOT ENFORCED"
+                                + ") WITH (\n"
+                                + "  'connector' = 'upsert-kafka',\n"
+                                + "  'topic' = '%s',\n"
+                                + "  'properties.bootstrap.servers' = '%s',\n"
+                                + "  'key.format' = '%s',\n"
+                                + "  'value.format' = '%s',\n"
+                                + "  'value.fields-include' = 'ALL',\n"
+                                + "  'key.format-projection-pushdown-level' = 'ALL',\n"
+                                + "  'value.format-projection-pushdown-level' = 'ALL'\n"
+                                + ")",
+                        topic, bootstraps, format, format);
+        tEnv.executeSql(originalCreateTable);
+        tEnv.executeSql("INSERT INTO upsert_kafka VALUES (1, 100, 'payload 1')").await();
+        tEnv.executeSql("DROP TABLE upsert_kafka").await();
+
+        tEnv.executeSql(
+                        String.format(
+                                "CREATE TABLE upsert_kafka (\n"
+                                        + "  `user_id` BIGINT,\n"
+                                        + "  `name` STRING,\n" // `name` is now a STRING field
+                                        + "  `payload` STRING,\n"
+                                        + "  PRIMARY KEY (user_id) NOT ENFORCED"
+                                        + ") WITH (\n"
+                                        + "  'connector' = 'upsert-kafka',\n"
+                                        + "  'topic' = '%s',\n"
+                                        + "  'properties.bootstrap.servers' = '%s',\n"
+                                        + "  'key.format' = '%s',\n"
+                                        + "  'value.format' = '%s',\n"
+                                        + "  'value.fields-include' = 'ALL',\n"
+                                        + "  'key.format-projection-pushdown-level' = 'ALL',\n"
+                                        + "  'value.format-projection-pushdown-level' = 'ALL'\n"
+                                        + ")",
+                                topic, bootstraps, format, format))
+                .await();
+        tEnv.executeSql("INSERT INTO upsert_kafka VALUES (2, 'not_an_int', 'payload 2')").await();
+        tEnv.executeSql("DROP TABLE upsert_kafka").await();
+
+        // Read data using original create table statement where `name` is still typed as an INT
+        tEnv.executeSql(originalCreateTable);
+
+        // If you try to read all the fields, you naturally get a deserialization exception
+        // because of the breaking schema change to field `name`
+        assertThatThrownBy(() -> collectRows(tEnv.sqlQuery("SELECT * FROM upsert_kafka"), 2))
+                .hasRootCauseInstanceOf(JsonParseException.class)
+                .hasRootCauseMessage("Fail to deserialize at field: name.");
+
+        // If you try to read just the fields that didn't have any breaking schema changes
+        // the query should work because projection pushdown ensures that fields that aren't
+        // needed aren't deserialized
+        final List<Row> result =
+                collectRows(tEnv.sqlQuery("SELECT user_id, payload FROM upsert_kafka"), 2);
+        final List<Row> expected =
+                Arrays.asList(
+                        changelogRow("+I", 1L, "payload 1"), changelogRow("+I", 2L, "payload 2"));
+        assertThat(result).satisfies(matching(deepEqualTo(expected, true)));
+
+        // ------------- cleanup -------------------
         deleteTestTopic(topic);
     }
 
