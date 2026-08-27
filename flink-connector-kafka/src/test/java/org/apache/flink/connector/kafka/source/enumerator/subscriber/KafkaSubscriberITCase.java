@@ -41,9 +41,9 @@ import static org.apache.flink.core.testutils.FlinkAssertions.anyCauseMatches;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Unit tests for {@link KafkaSubscriber}. */
+/** Integration tests for {@link KafkaSubscriber}. */
 @ResourceLock("KafkaTestBase")
-class KafkaSubscriberTest {
+class KafkaSubscriberITCase {
     private static final String TOPIC1 = "topic1";
     private static final String TOPIC2 = "pattern-topic";
     private static final TopicPartition NON_EXISTING_TOPIC = new TopicPartition("removed", 0);

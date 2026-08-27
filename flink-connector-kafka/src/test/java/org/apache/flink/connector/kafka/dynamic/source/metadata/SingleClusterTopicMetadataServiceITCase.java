@@ -39,10 +39,10 @@ import java.util.Set;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 
-class SingleClusterTopicMetadataServiceTest {
+class SingleClusterTopicMetadataServiceITCase {
 
-    private static final String TOPIC0 = "SingleClusterTopicMetadataServiceTest-1";
-    private static final String TOPIC1 = "SingleClusterTopicMetadataServiceTest-2";
+    private static final String TOPIC0 = "SingleClusterTopicMetadataServiceITCase-1";
+    private static final String TOPIC1 = "SingleClusterTopicMetadataServiceITCase-2";
 
     private static KafkaMetadataService kafkaMetadataService;
     private static KafkaTestBase.KafkaClusterTestEnvMetadata kafkaClusterTestEnvMetadata0;

@@ -72,9 +72,9 @@ import static org.apache.flink.connector.kafka.testutils.KafkaSourceTestEnv.NUM_
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Unit tests for {@link KafkaPartitionSplitReader}. */
+/** Integration tests for {@link KafkaPartitionSplitReader}. */
 @ResourceLock("KafkaTestBase")
-public class KafkaPartitionSplitReaderTest {
+public class KafkaPartitionSplitReaderITCase {
     private static final int NUM_SUBTASKS = 3;
     private static final String TOPIC1 = "topic1";
     private static final String TOPIC2 = "topic2";

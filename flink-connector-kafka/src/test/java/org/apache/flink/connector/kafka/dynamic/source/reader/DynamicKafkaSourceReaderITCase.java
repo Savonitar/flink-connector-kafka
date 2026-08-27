@@ -81,8 +81,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 /**
  * Test for {@link org.apache.flink.connector.kafka.dynamic.source.reader.DynamicKafkaSourceReader}.
  */
-public class DynamicKafkaSourceReaderTest extends SourceReaderTestBase<DynamicKafkaSourceSplit> {
-    private static final String TOPIC = "DynamicKafkaSourceReaderTest";
+public class DynamicKafkaSourceReaderITCase extends SourceReaderTestBase<DynamicKafkaSourceSplit> {
+    private static final String TOPIC = "DynamicKafkaSourceReaderITCase";
 
     private static class TrackingReaderOutput<E> extends TestingReaderOutput<E> {
         private final List<String> releasedSplitIds = new ArrayList<>();

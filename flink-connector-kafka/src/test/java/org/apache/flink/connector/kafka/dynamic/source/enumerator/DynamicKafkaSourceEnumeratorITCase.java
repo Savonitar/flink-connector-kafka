@@ -86,9 +86,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.slf4j.event.Level.DEBUG;
 
 /** A test for {@link DynamicKafkaSourceEnumerator}. */
-public class DynamicKafkaSourceEnumeratorTest {
+public class DynamicKafkaSourceEnumeratorITCase {
     private static final int NUM_SUBTASKS = 3;
-    private static final String TOPIC = "DynamicKafkaSourceEnumeratorTest";
+    private static final String TOPIC = "DynamicKafkaSourceEnumeratorITCase";
     private static final int NUM_SPLITS_PER_CLUSTER = 3;
     private static final int NUM_RECORDS_PER_SPLIT = 5;
     private static final String SOURCE_READER_SPLIT_STATE_NAME = "source-reader-splits";

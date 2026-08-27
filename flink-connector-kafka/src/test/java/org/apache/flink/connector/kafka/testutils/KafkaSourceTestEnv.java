@@ -47,7 +47,7 @@ import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Base class for KafkaSource unit tests. */
+/** Base class for KafkaSource integration tests. */
 public class KafkaSourceTestEnv extends KafkaTestBase {
     public static final String GROUP_ID = "KafkaSourceTestEnv";
     public static final int NUM_PARTITIONS = 10;

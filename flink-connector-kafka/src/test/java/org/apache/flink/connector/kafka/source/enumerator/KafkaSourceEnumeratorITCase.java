@@ -63,9 +63,9 @@ import java.util.stream.Collectors;
 import static org.apache.flink.connector.kafka.source.split.KafkaPartitionSplit.MIGRATED;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Unit tests for {@link KafkaSourceEnumerator}. */
+/** Integration tests for {@link KafkaSourceEnumerator}. */
 @ResourceLock("KafkaTestBase")
-public class KafkaSourceEnumeratorTest {
+public class KafkaSourceEnumeratorITCase {
     private static final int NUM_SUBTASKS = 3;
     private static final String DYNAMIC_TOPIC_NAME = "dynamic_topic";
     private static final int NUM_PARTITIONS_DYNAMIC_TOPIC = 4;

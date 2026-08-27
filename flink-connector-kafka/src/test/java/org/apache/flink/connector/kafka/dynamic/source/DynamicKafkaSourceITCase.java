@@ -117,9 +117,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Integration tests for {@link org.apache.flink.connector.kafka.dynamic.source.DynamicKafkaSource}.
  */
-class DynamicKafkaSourceITTest {
+class DynamicKafkaSourceITCase {
 
-    private static final String TOPIC = "DynamicKafkaSourceITTest";
+    private static final String TOPIC = "DynamicKafkaSourceITCase";
     private static final int NUM_PARTITIONS = 3;
     private static final int NUM_RECORDS_PER_SPLIT = 5;
 

@@ -18,7 +18,6 @@
 
 package org.apache.flink.streaming.connectors.kafka.internals.metrics;
 
-import org.apache.flink.connector.kafka.testutils.TestKafkaContainer;
 import org.apache.flink.metrics.Gauge;
 
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -27,9 +26,6 @@ import org.apache.kafka.common.Metric;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.Network;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -38,19 +34,12 @@ import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Stream;
 
-import static org.apache.flink.connector.kafka.testutils.KafkaUtil.createKafkaContainer;
-
-@Testcontainers
+/** Unit tests for {@link KafkaMetricMutableWrapper}. */
 class KafkaMetricMutableWrapperTest {
 
-    private static final String INTER_CONTAINER_KAFKA_ALIAS = "kafka";
-    private static final Network NETWORK = Network.newNetwork();
-
-    @Container
-    public static final TestKafkaContainer KAFKA_CONTAINER =
-            createKafkaContainer(KafkaMetricMutableWrapperTest.class)
-                    .withNetwork(NETWORK)
-                    .withNetworkAliases(INTER_CONTAINER_KAFKA_ALIAS);
+    // The clients are never used to communicate with a broker: only their locally registered
+    // metrics are wrapped and read, so a syntactically valid address is all that is needed.
+    private static final String DUMMY_BOOTSTRAP_SERVERS = "localhost:12345";
 
     @Test
     void testOnlyMeasurableMetricsAreRegisteredWithMutableWrapper() {
@@ -77,7 +66,7 @@ class KafkaMetricMutableWrapperTest {
 
     private static Properties getKafkaClientConfiguration() {
         final Properties standardProps = new Properties();
-        standardProps.put("bootstrap.servers", KAFKA_CONTAINER.getBootstrapServers());
+        standardProps.put("bootstrap.servers", DUMMY_BOOTSTRAP_SERVERS);
         standardProps.put("group.id", UUID.randomUUID().toString());
         standardProps.put("enable.auto.commit", false);
         standardProps.put("key.deserializer", ByteArrayDeserializer.class.getName());

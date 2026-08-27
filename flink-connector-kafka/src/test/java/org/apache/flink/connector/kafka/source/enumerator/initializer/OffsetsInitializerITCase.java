@@ -39,9 +39,9 @@ import java.util.stream.Collectors;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Unit tests for {@link OffsetsInitializer}. */
+/** Integration tests for {@link OffsetsInitializer}. */
 @ResourceLock("KafkaTestBase")
-class OffsetsInitializerTest {
+class OffsetsInitializerITCase {
     private static final String TOPIC = "topic";
     private static final String TOPIC2 = "topic2";
     private static final String EMPTY_TOPIC3 = "topic3";

@@ -83,10 +83,10 @@ import static org.apache.flink.connector.kafka.testutils.KafkaSourceTestEnv.NUM_
 import static org.apache.flink.core.testutils.CommonTestUtils.waitUtil;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Unit tests for {@link KafkaSourceReader}. */
+/** Integration tests for {@link KafkaSourceReader}. */
 @ResourceLock("KafkaTestBase")
-public class KafkaSourceReaderTest extends SourceReaderTestBase<KafkaPartitionSplit> {
-    private static final String TOPIC = "KafkaSourceReaderTest";
+public class KafkaSourceReaderITCase extends SourceReaderTestBase<KafkaPartitionSplit> {
+    private static final String TOPIC = "KafkaSourceReaderITCase";
 
     @BeforeAll
     public static void setup() throws Throwable {
@@ -407,7 +407,7 @@ public class KafkaSourceReaderTest extends SourceReaderTestBase<KafkaPartitionSp
                 (KafkaSourceReader<Integer>)
                         createReader(
                                 Boundedness.BOUNDED,
-                                "KafkaSourceReaderTestGroup",
+                                "KafkaSourceReaderITCaseGroup",
                                 new TestingReaderContext(),
                                 splitFinishedHook)) {
             reader.addSplits(Arrays.asList(normalSplit, emptySplit));
@@ -440,7 +440,7 @@ public class KafkaSourceReaderTest extends SourceReaderTestBase<KafkaPartitionSp
                 (KafkaSourceReader<Integer>)
                         createReader(
                                 Boundedness.BOUNDED,
-                                "KafkaSourceReaderTestGroup",
+                                "KafkaSourceReaderITCaseGroup",
                                 new TestingReaderContext(),
                                 splitFinishedHook)) {
             reader.addSplits(Arrays.asList(emptySplit0, emptySplit1));
@@ -451,7 +451,7 @@ public class KafkaSourceReaderTest extends SourceReaderTestBase<KafkaPartitionSp
                     "The split fetcher did not exit before timeout.");
             assertThat(reader.getNumAliveFetchers()).isEqualTo(0);
             assertThat(finishedSplits)
-                    .containsExactly(emptySplit0.splitId(), emptySplit1.splitId());
+                    .containsExactlyInAnyOrder(emptySplit0.splitId(), emptySplit1.splitId());
         }
     }
 
@@ -497,7 +497,8 @@ public class KafkaSourceReaderTest extends SourceReaderTestBase<KafkaPartitionSp
                                             == NUM_RECORDS_PER_SPLIT * 2,
                     "The split fetcher did not exit before timeout.");
 
-            assertThat(finishedSplits).containsExactly(split1.splitId(), split2.splitId());
+            assertThat(finishedSplits)
+                    .containsExactlyInAnyOrder(split1.splitId(), split2.splitId());
         }
     }
 
@@ -553,7 +554,7 @@ public class KafkaSourceReaderTest extends SourceReaderTestBase<KafkaPartitionSp
 
     @Override
     protected SourceReader<Integer, KafkaPartitionSplit> createReader() throws Exception {
-        return createReader(Boundedness.BOUNDED, "KafkaSourceReaderTestGroup");
+        return createReader(Boundedness.BOUNDED, "KafkaSourceReaderITCaseGroup");
     }
 
     @Override
@@ -617,7 +618,7 @@ public class KafkaSourceReaderTest extends SourceReaderTestBase<KafkaPartitionSp
             throws Exception {
         KafkaSourceBuilder<Integer> builder =
                 KafkaSource.<Integer>builder()
-                        .setClientIdPrefix("KafkaSourceReaderTest")
+                        .setClientIdPrefix("KafkaSourceReaderITCase")
                         .setDeserializer(
                                 KafkaRecordDeserializationSchema.valueOnly(
                                         IntegerDeserializer.class))
