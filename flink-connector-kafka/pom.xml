@@ -42,6 +42,11 @@ under the License.
         KafkaProducerExactlyOnceITCase -->
 			--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
 		</flink.connector.module.config>
+		<!-- Restore surefire's default inner-class exclusion, which the explicit <excludes>
+		in flink-connector-parent's surefire executions override. Without it, compiled
+		@Nested classes (Outer$Inner.class) are selected as standalone test sets in addition
+		to being discovered through their outer class, so those suites execute twice. -->
+		<additionalExcludes>**/*$*</additionalExcludes>
 	</properties>
 
 	<dependencies>
