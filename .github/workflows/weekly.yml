@@ -25,47 +25,133 @@ on:
     - cron: "0 0 * * 0"
   workflow_dispatch:
 jobs:
+  prepare_matrix:
+    if: github.repository_owner == 'apache'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Find previous green weekly run
+        id: previous
+        uses: actions/github-script@v9
+        with:
+          script: |
+            core.setOutput('run_id', '');
+            if (context.eventName !== 'schedule') {
+              return;
+            }
+            try {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                ...context.repo,
+                workflow_id: 'weekly.yml',
+                branch: context.ref.replace('refs/heads/', ''),
+                per_page: 100,
+              });
+              // A failed previous run must not be hidden by an older successful run.
+              const previous = data.workflow_runs
+                .filter(run => run.run_number < context.runNumber)
+                .sort((a, b) => b.run_number - a.run_number)[0];
+              if (previous?.conclusion === 'success' && previous.head_sha === context.sha) {
+                core.setOutput('run_id', String(previous.id));
+              }
+            } catch (error) {
+              core.warning(`Cannot read previous weekly run; running the full matrix: ${error.message}`);
+            }
+      - name: Download previous matrix
+        if: steps.previous.outputs.run_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: weekly-matrix
+          run-id: ${{ steps.previous.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: state
+      - name: Select weekly matrix
+        id: matrix
+        uses: actions/github-script@v9
+        env:
+          # Release lines run a single JDK to stay under the ASF limit of 20 concurrent jobs.
+          FLINK_BRANCHES: >-
+            [
+              {"flink": "2.2-SNAPSHOT", "branch": "main"},
+              {"flink": "2.2.1", "branch": "v5.0", "jdk": "17"},
+              {"flink": "2.1.3", "branch": "v5.0", "jdk": "17"},
+              {"flink": "2.0.2", "branch": "v4.0", "jdk": "17"},
+              {"flink": "1.20.5", "branch": "v3.4", "jdk": "11"}
+            ]
+        with:
+          script: |
+            const fs = require('fs');
+            const matrix = JSON.parse(process.env.FLINK_BRANCHES);
+            let previous;
+            try {
+              previous = JSON.parse(fs.readFileSync('state/weekly-matrix.json', 'utf8'));
+            } catch (error) {
+              core.info('No usable previous matrix; running the full matrix.');
+            }
+
+            const shas = {};
+            for (const branch of new Set(matrix.map(entry => entry.branch))) {
+              try {
+                const { data } = await github.rest.repos.getBranch({ ...context.repo, branch });
+                shas[branch] = data.commit.sha;
+              } catch (error) {
+                core.warning(`Cannot resolve ${branch}; running the full matrix: ${error.message}`);
+              }
+            }
+
+            // Both Java and Python must test the SHAs recorded in the baseline.
+            const resolved = matrix.map(entry => ({ ...entry, sha: shas[entry.branch] }));
+            const complete = resolved.every(entry => entry.sha);
+            const runFixed = context.eventName !== 'schedule'
+              || !complete
+              || JSON.stringify(previous) !== JSON.stringify(resolved);
+            core.info(runFixed
+              ? 'Running snapshots and released Flink versions.'
+              : 'No new commits since the previous green weekly; running snapshots only.');
+
+            const selected = resolved.filter(entry => runFixed || entry.flink.endsWith('-SNAPSHOT'));
+            core.setOutput('matrix', JSON.stringify(selected));
+            // Preserve the full baseline across snapshot-only runs; unresolved SHAs invalidate it.
+            const state = complete ? resolved : [];
+            fs.mkdirSync('state', { recursive: true });
+            fs.writeFileSync('state/weekly-matrix.json', JSON.stringify(state));
+      # This baseline is reusable only after the entire weekly run (Java and Python) succeeds.
+      - name: Save weekly matrix
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: weekly-matrix
+          path: state/weekly-matrix.json
+          overwrite: true
+          retention-days: 90
+
   compile_and_test:
+    needs: prepare_matrix
     if: github.repository_owner == 'apache'
     strategy:
       fail-fast: false
       matrix:
-        # Release lines run a single JDK to stay under the ASF limit of 20 concurrent jobs.
-        flink_branches: &flink_branches_matrix [{
-          flink: 2.2-SNAPSHOT,
-          branch: main
-        }, {
-          flink: 2.2.1,
-          branch: v5.0,
-          jdk: '17'
-        }, {
-          flink: 2.1.3,
-          branch: v5.0,
-          jdk: '17'
-        }, {
-          flink: 2.0.2,
-          branch: v4.0,
-          jdk: '17'
-        }, {
-          flink: 1.20.5,
-          branch: v3.4,
-          jdk: '11'
-        }]
+        flink_branches: ${{ fromJSON(needs.prepare_matrix.outputs.matrix) }}
     uses: apache/flink-connector-shared-utils/.github/workflows/ci.yml@ci_utils
     with:
       flink_version: ${{ matrix.flink_branches.flink }}
-      connector_branch: ${{ matrix.flink_branches.branch }}
+      connector_branch: ${{ matrix.flink_branches.sha || matrix.flink_branches.branch }}
       jdk_version: ${{ matrix.flink_branches.jdk || '11, 17, 21' }}
       run_dependency_convergence: false
       timeout_test: 45
   python_test:
+    needs: prepare_matrix
     if: github.repository_owner == 'apache'
     strategy:
       fail-fast: false
       matrix:
-        flink_branches: *flink_branches_matrix
+        flink_branches: ${{ fromJSON(needs.prepare_matrix.outputs.matrix) }}
     uses: apache/flink-connector-shared-utils/.github/workflows/python_ci.yml@ci_utils
     with:
       flink_version: ${{ matrix.flink_branches.flink }}
-      connector_branch: ${{ matrix.flink_branches.branch }}
+      connector_branch: ${{ matrix.flink_branches.sha || matrix.flink_branches.branch }}
       jdk_version: '17'
