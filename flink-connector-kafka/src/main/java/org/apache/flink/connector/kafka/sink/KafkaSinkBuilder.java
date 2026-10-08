@@ -76,6 +76,7 @@ public class KafkaSinkBuilder<IN> {
     private final Properties kafkaProducerConfig;
     private KafkaRecordSerializationSchema<IN> recordSerializer;
     private TransactionNamingStrategy transactionNamingStrategy = TransactionNamingStrategy.DEFAULT;
+    private TransactionAbortMethod transactionAbortMethod = TransactionAbortMethod.DEFAULT;
 
     KafkaSinkBuilder() {
         kafkaProducerConfig = new Properties();
@@ -138,6 +139,20 @@ public class KafkaSinkBuilder<IN> {
         this.transactionNamingStrategy =
                 checkNotNull(
                         transactionNamingStrategy, "transactionNamingStrategy must not be null");
+        return this;
+    }
+
+    /**
+     * Sets the {@link TransactionAbortMethod} that is used to abort transactions left open by a
+     * previous execution when the sink recovers with {@link DeliveryGuarantee#EXACTLY_ONCE}.
+     *
+     * <p>By default {@link TransactionAbortMethod#DEFAULT} is used. The method changes how each
+     * transactional id is aborted, not which ones; see {@link TransactionAbortMethod}.
+     */
+    public KafkaSinkBuilder<IN> setTransactionAbortMethod(
+            TransactionAbortMethod transactionAbortMethod) {
+        this.transactionAbortMethod =
+                checkNotNull(transactionAbortMethod, "transactionAbortMethod must not be null");
         return this;
     }
 
@@ -222,6 +237,7 @@ public class KafkaSinkBuilder<IN> {
                 kafkaProducerConfig,
                 transactionalIdPrefix,
                 recordSerializer,
-                transactionNamingStrategy);
+                transactionNamingStrategy,
+                transactionAbortMethod);
     }
 }

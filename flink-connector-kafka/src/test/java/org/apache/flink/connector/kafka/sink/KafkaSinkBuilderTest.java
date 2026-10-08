@@ -92,6 +92,21 @@ class KafkaSinkBuilderTest {
                         "EXACTLY_ONCE delivery guarantee requires a transactionalIdPrefix to be set to provide unique transaction names across multiple KafkaSinks writing to the same Kafka cluster.");
     }
 
+    @Test
+    void testTransactionAbortMethod() {
+        assertThat(getBasicBuilder().build().getTransactionAbortMethod())
+                .isEqualTo(TransactionAbortMethod.DEFAULT);
+        assertThat(
+                        getBasicBuilder()
+                                .setTransactionAbortMethod(
+                                        TransactionAbortMethod.ADMIN_FENCE_PRODUCERS)
+                                .build()
+                                .getTransactionAbortMethod())
+                .isEqualTo(TransactionAbortMethod.ADMIN_FENCE_PRODUCERS);
+        assertThatThrownBy(() -> getBasicBuilder().setTransactionAbortMethod(null))
+                .isInstanceOf(NullPointerException.class);
+    }
+
     private void validateProducerConfig(
             KafkaSinkBuilder<?> builder, Consumer<Properties> validator) {
         validator.accept(builder.build().getKafkaProducerConfig());

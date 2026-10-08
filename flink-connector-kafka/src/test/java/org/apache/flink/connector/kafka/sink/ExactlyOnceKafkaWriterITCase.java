@@ -35,23 +35,38 @@ import org.apache.flink.test.junit5.MiniClusterExtension;
 import com.google.common.collect.Iterables;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerInterceptor;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.errors.ProducerFencedException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.apache.flink.connector.kafka.sink.internal.TransactionalIdFactory.buildTransactionalId;
 import static org.apache.flink.connector.kafka.testutils.KafkaUtil.drainAllRecordsFromTopic;
+import static org.apache.flink.core.testutils.CommonTestUtils.waitUtil;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.AssertionsForClassTypes.assertThatCode;
 
@@ -205,8 +220,9 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
     }
 
     /** Test that producer is not accidentally recreated or pool is used. */
-    @Test
-    void shouldAbortLingeringTransactions() throws Exception {
+    @ParameterizedTest
+    @EnumSource(TransactionAbortMethod.class)
+    void shouldAbortLingeringTransactions(TransactionAbortMethod abortMethod) throws Exception {
         try (final ExactlyOnceKafkaWriter<Integer> failedWriter =
                 createWriter(DeliveryGuarantee.EXACTLY_ONCE)) {
 
@@ -223,8 +239,31 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
                             TransactionOwnership.IMPLICIT_BY_SUBTASK_ID,
                             List.of());
 
+            final String recorderId = UUID.randomUUID().toString();
             try (final KafkaWriter<Integer> recoveredWriter =
-                    restoreWriter(EXACTLY_ONCE, List.of(state), createInitContext())) {
+                    restoreWriter(
+                            EXACTLY_ONCE.andThen(
+                                    builder ->
+                                            builder.setTransactionAbortMethod(abortMethod)
+                                                    .setProperty(
+                                                            ProducerConfig
+                                                                    .INTERCEPTOR_CLASSES_CONFIG,
+                                                            AbortPhaseProducerRecorder.class
+                                                                    .getName())
+                                                    .setProperty(
+                                                            AbortPhaseProducerRecorder
+                                                                    .RECORDER_ID_CONFIG,
+                                                            recorderId)),
+                            List.of(state),
+                            createInitContext())) {
+                if (abortMethod == TransactionAbortMethod.ADMIN_FENCE_PRODUCERS) {
+                    // the admin path aborts without constructing a producer
+                    assertThat(AbortPhaseProducerRecorder.constructedWhileAborting(recorderId))
+                            .isZero();
+                } else {
+                    assertThat(AbortPhaseProducerRecorder.constructedWhileAborting(recorderId))
+                            .isPositive();
+                }
                 recoveredWriter.write(1, SINK_WRITER_CONTEXT);
 
                 recoveredWriter.flush(false);
@@ -245,8 +284,9 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
 
     /** Test that writer does not abort those transactions that are passed in as writer state. */
     @ParameterizedTest
-    @ValueSource(ints = {1, 2, 3})
-    void shouldNotAbortPrecommittedTransactions(int numCheckpointed) throws Exception {
+    @MethodSource("precommittedTransactionsParameters")
+    void shouldNotAbortPrecommittedTransactions(
+            int numCheckpointed, TransactionAbortMethod abortMethod) throws Exception {
         try (final KafkaWriter<Integer> failedWriter =
                 createWriter(DeliveryGuarantee.EXACTLY_ONCE)) {
 
@@ -260,7 +300,7 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
             // assume a varying number of states that have been checkpointed
             try (final ExactlyOnceKafkaWriter<Integer> recoveredWriter =
                     restoreWriter(
-                            this::withPooling,
+                            builder -> withPooling(builder).setTransactionAbortMethod(abortMethod),
                             List.of(states.get(numCheckpointed - 1)),
                             createInitContext())) {
                 // test abort of recoveredWriter; this should abort all transactions that have
@@ -273,6 +313,50 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
                 }
             }
         }
+    }
+
+    static Stream<Arguments> precommittedTransactionsParameters() {
+        return Stream.of(1, 2, 3)
+                .flatMap(
+                        numCheckpointed ->
+                                Arrays.stream(TransactionAbortMethod.values())
+                                        .map(method -> Arguments.of(numCheckpointed, method)));
+    }
+
+    /** Test that the writer closes the admin client of the recovery sweep once the sweep ends. */
+    @ParameterizedTest
+    @MethodSource("sweepsWithAdminClient")
+    void shouldCloseAdminClientAfterAbortingLingeringTransactions(
+            TransactionNamingStrategy namingStrategy, TransactionAbortMethod abortMethod)
+            throws Exception {
+        final Set<Thread> adminThreadsBefore = aliveAdminClientThreads();
+        try (final ExactlyOnceKafkaWriter<Integer> writer =
+                createWriter(
+                        builder ->
+                                builder.setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+                                        .setTransactionNamingStrategy(namingStrategy)
+                                        .setTransactionAbortMethod(abortMethod),
+                        createInitContext())) {
+            // the bounded close may return before the I/O thread has ended
+            waitUtil(
+                    () -> adminThreadsBefore.containsAll(aliveAdminClientThreads()),
+                    Duration.ofSeconds(30),
+                    "The admin client of the recovery sweep is still running.");
+        }
+    }
+
+    static Stream<Arguments> sweepsWithAdminClient() {
+        // probing through producers is the only sweep without an admin client
+        return Stream.of(
+                Arguments.of(
+                        TransactionNamingStrategy.INCREMENTING,
+                        TransactionAbortMethod.ADMIN_FENCE_PRODUCERS),
+                Arguments.of(
+                        TransactionNamingStrategy.POOLING,
+                        TransactionAbortMethod.PRODUCER_INIT_TRANSACTIONS),
+                Arguments.of(
+                        TransactionNamingStrategy.POOLING,
+                        TransactionAbortMethod.ADMIN_FENCE_PRODUCERS));
     }
 
     /** Test that producers are reused when committed. */
@@ -428,6 +512,13 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
         return ((ProducerPoolImpl) writer.getProducerPool()).getProducers();
     }
 
+    private static Set<Thread> aliveAdminClientThreads() {
+        return Thread.getAllStackTraces().keySet().stream()
+                .filter(Thread::isAlive)
+                .filter(thread -> thread.getName().contains("kafka-admin-client-thread"))
+                .collect(Collectors.toSet());
+    }
+
     private KafkaSinkBuilder<?> withPooling(KafkaSinkBuilder<?> builder) {
         return builder.setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
                 .setTransactionNamingStrategy(TransactionNamingStrategy.POOLING);
@@ -442,5 +533,48 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
         KafkaCommittable committable = Iterables.getOnlyElement(failedWriter.prepareCommit());
         KafkaWriterState state = Iterables.getOnlyElement(failedWriter.snapshotState(checkpointId));
         return Tuple2.of(state, committable);
+    }
+
+    /**
+     * Counts the producers constructed while the writer aborts lingering transactions, that is with
+     * {@code abortLingeringTransactions} on the constructing thread's stack.
+     */
+    public static class AbortPhaseProducerRecorder implements ProducerInterceptor<byte[], byte[]> {
+        static final String RECORDER_ID_CONFIG = "test.recorder.id";
+        private static final Map<String, AtomicInteger> CONSTRUCTED_WHILE_ABORTING =
+                new ConcurrentHashMap<>();
+
+        static int constructedWhileAborting(String recorderId) {
+            final AtomicInteger count = CONSTRUCTED_WHILE_ABORTING.get(recorderId);
+            return count == null ? 0 : count.get();
+        }
+
+        @Override
+        public void configure(Map<String, ?> configs) {
+            final boolean aborting =
+                    Arrays.stream(new Throwable().getStackTrace())
+                            .anyMatch(
+                                    frame ->
+                                            frame.getMethodName()
+                                                    .equals("abortLingeringTransactions"));
+            if (aborting) {
+                CONSTRUCTED_WHILE_ABORTING
+                        .computeIfAbsent(
+                                String.valueOf(configs.get(RECORDER_ID_CONFIG)),
+                                id -> new AtomicInteger())
+                        .incrementAndGet();
+            }
+        }
+
+        @Override
+        public ProducerRecord<byte[], byte[]> onSend(ProducerRecord<byte[], byte[]> record) {
+            return record;
+        }
+
+        @Override
+        public void onAcknowledgement(RecordMetadata metadata, Exception exception) {}
+
+        @Override
+        public void close() {}
     }
 }

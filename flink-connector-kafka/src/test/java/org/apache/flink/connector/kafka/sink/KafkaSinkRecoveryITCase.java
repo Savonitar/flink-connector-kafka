@@ -64,9 +64,10 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
@@ -134,9 +135,12 @@ class KafkaSinkRecoveryITCase {
         IOUtils.closeAll(cleanupActions, Throwable.class);
     }
 
-    @Test
+    @ParameterizedTest
+    @EnumSource(TransactionAbortMethod.class)
     void recoversPooledTransactionsWithoutLosingNewRecords(
-            @TempDir Path checkpointDirectory, @InjectMiniCluster MiniCluster miniCluster)
+            TransactionAbortMethod abortMethod,
+            @TempDir Path checkpointDirectory,
+            @InjectMiniCluster MiniCluster miniCluster)
             throws Exception {
         final String topic = "pooling-recovery-" + UUID.randomUUID();
         final String transactionalIdPrefix = "pooling-" + UUID.randomUUID();
@@ -156,7 +160,13 @@ class KafkaSinkRecoveryITCase {
         final SharedReference<PipelineControls> recoveredControls =
                 sharedObjects.add(PipelineControls.withoutSnapshotBlocking());
         final JobClient original =
-                startJob(topic, transactionalIdPrefix, checkpointDirectory, originalControls, null);
+                startJob(
+                        topic,
+                        transactionalIdPrefix,
+                        abortMethod,
+                        checkpointDirectory,
+                        originalControls,
+                        null);
         emit(originalControls, 0L);
         final String checkpointOnePath =
                 miniCluster
@@ -207,6 +217,7 @@ class KafkaSinkRecoveryITCase {
                 startJob(
                         topic,
                         transactionalIdPrefix,
+                        abortMethod,
                         checkpointDirectory,
                         recoveredControls,
                         checkpointOnePath);
@@ -230,6 +241,7 @@ class KafkaSinkRecoveryITCase {
     private JobClient startJob(
             String topic,
             String transactionalIdPrefix,
+            TransactionAbortMethod abortMethod,
             Path checkpointDirectory,
             SharedReference<PipelineControls> controls,
             @Nullable String restorePath)
@@ -270,6 +282,7 @@ class KafkaSinkRecoveryITCase {
                                 .setBootstrapServers(KAFKA.getBootstrapServers())
                                 .setTransactionalIdPrefix(transactionalIdPrefix)
                                 .setTransactionNamingStrategy(TransactionNamingStrategy.POOLING)
+                                .setTransactionAbortMethod(abortMethod)
                                 .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
                                 .setRecordSerializer(
                                         KafkaRecordSerializationSchema.builder()

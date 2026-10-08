@@ -18,6 +18,8 @@
 
 package org.apache.flink.connector.kafka.sink.internal;
 
+import org.apache.flink.connector.kafka.sink.TransactionAbortMethod;
+
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
@@ -28,6 +30,7 @@ import java.util.Set;
 
 import static org.apache.flink.api.connector.sink2.InitContext.INITIAL_CHECKPOINT_ID;
 import static org.apache.flink.connector.kafka.sink.internal.TransactionAbortStrategyImpl.LISTING;
+import static org.apache.flink.connector.kafka.sink.internal.TransactionAbortStrategyImpl.PROBING;
 import static org.apache.flink.connector.kafka.sink.internal.TransactionalIdFactory.extractSubtaskId;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -50,7 +53,7 @@ class TransactionAbortStrategyImplTest {
             String t12 = testContext.addOpenTransaction(1, 2L);
             testContext.addOpenTransaction(2, 2L); // not owned
 
-            LISTING.abortTransactions(testContext);
+            assertThat(LISTING.abortTransactions(testContext)).isEqualTo(2);
             assertThat(testContext.getAbortedTransactions()).containsExactlyInAnyOrder(t02, t12);
         }
 
@@ -67,7 +70,7 @@ class TransactionAbortStrategyImplTest {
             String t22 = testContext.addOpenTransaction(2, 2L);
             String t32 = testContext.addOpenTransaction(3, 2L);
 
-            LISTING.abortTransactions(testContext);
+            assertThat(LISTING.abortTransactions(testContext)).isEqualTo(2);
             assertThat(testContext.getAbortedTransactions()).containsExactlyInAnyOrder(t22, t32);
         }
 
@@ -84,7 +87,7 @@ class TransactionAbortStrategyImplTest {
             String t52 = testContext.addOpenTransaction(5, 2L);
             testContext.addOpenTransaction(6, 2L); // not owned
 
-            LISTING.abortTransactions(testContext);
+            assertThat(LISTING.abortTransactions(testContext)).isEqualTo(3);
             assertThat(testContext.getAbortedTransactions())
                     .containsExactlyInAnyOrder(t02, t12, t52);
         }
@@ -100,7 +103,7 @@ class TransactionAbortStrategyImplTest {
             String t02 = testContext.addOpenTransaction(0, 2L);
             testContext.addOpenTransaction(1, 2L); // not owned
 
-            LISTING.abortTransactions(testContext);
+            assertThat(LISTING.abortTransactions(testContext)).isEqualTo(1);
             assertThat(testContext.getAbortedTransactions()).containsExactlyInAnyOrder(t02);
         }
 
@@ -115,7 +118,7 @@ class TransactionAbortStrategyImplTest {
             String t42 = testContext.addOpenTransaction(4, 2L);
             testContext.addOpenTransaction(5, 2L); // not owned
 
-            LISTING.abortTransactions(testContext);
+            assertThat(LISTING.abortTransactions(testContext)).isEqualTo(2);
             assertThat(testContext.getAbortedTransactions()).containsExactlyInAnyOrder(t02, t42);
         }
 
@@ -128,8 +131,65 @@ class TransactionAbortStrategyImplTest {
             String t31 = testContext.addOpenTransaction(3, 1L);
             String t32 = testContext.addOpenTransaction(3, 2L);
 
-            LISTING.abortTransactions(testContext);
+            assertThat(LISTING.abortTransactions(testContext)).isEqualTo(2);
             assertThat(testContext.getAbortedTransactions()).containsExactlyInAnyOrder(t31, t32);
+        }
+    }
+
+    @Nested
+    class Probing {
+        @Test
+        void testReturnsNumberOfFencedTransactionalIds() {
+            TestContext testContext = new TestContext();
+            testContext.setSubtaskIdAndParallelism(0, 1);
+            String t01 = testContext.addOpenTransaction(0, 1L);
+            String t02 = testContext.addOpenTransaction(0, 2L);
+            String t03 = testContext.addOpenTransaction(0, 3L);
+
+            assertThat(PROBING.abortTransactions(testContext)).isEqualTo(3);
+            // probing stops at the first unknown id of each subtask and at the first subtask
+            // without known ids
+            assertThat(testContext.getAbortedTransactions())
+                    .containsExactly(
+                            t01,
+                            t02,
+                            t03,
+                            testContext.getTransactionalId(0, 4L),
+                            testContext.getTransactionalId(1, 1L));
+        }
+
+        @Test
+        void testDownscaleCountsFencedIdsOfRemovedSubtasks() {
+            TestContext testContext = new TestContext();
+            testContext.setSubtaskIdAndParallelism(0, 2);
+            testContext.addOpenTransaction(0, 1L);
+            testContext.addOpenTransaction(0, 2L);
+            testContext.addOpenTransaction(2, 1L);
+            testContext.addOpenTransaction(1, 1L); // probed by subtask 1
+
+            assertThat(PROBING.abortTransactions(testContext)).isEqualTo(3);
+        }
+
+        @Test
+        void testSumsAllPrefixes() {
+            TestContext testContext = new TestContext();
+            testContext.setSubtaskIdAndParallelism(0, 1);
+            testContext.addOpenTransaction(0, 1L);
+            testContext.setPrefix("previous-prefix");
+            testContext.addOpenTransaction(0, 1L);
+            testContext.addOpenTransaction(0, 2L);
+
+            assertThat(PROBING.abortTransactions(testContext)).isEqualTo(3);
+        }
+
+        @Test
+        void testReturnsZeroWithoutKnownIds() {
+            TestContext testContext = new TestContext();
+            testContext.setSubtaskIdAndParallelism(0, 1);
+
+            assertThat(PROBING.abortTransactions(testContext)).isZero();
+            assertThat(testContext.getAbortedTransactions())
+                    .containsExactly(testContext.getTransactionalId(0, 1L));
         }
     }
 
@@ -201,10 +261,19 @@ class TransactionAbortStrategyImplTest {
         }
 
         @Override
-        public TransactionAbortStrategyImpl.TransactionAborter getTransactionAborter() {
-            return transactionalId -> {
-                abortedTransactions.add(transactionalId);
-                return 0;
+        public TransactionAborter getTransactionAborter() {
+            return new TransactionAborter() {
+                @Override
+                public int abortTransaction(String transactionalId) {
+                    abortedTransactions.add(transactionalId);
+                    // like the coordinator: a bumped epoch for a known id, 0 for an id it never saw
+                    return openTransactionalIds.contains(transactionalId) ? 1 : 0;
+                }
+
+                @Override
+                public TransactionAbortMethod methodName() {
+                    return TransactionAbortMethod.DEFAULT;
+                }
             };
         }
 
@@ -228,7 +297,7 @@ class TransactionAbortStrategyImplTest {
             }
         }
 
-        private String getTransactionalId(int oldSubtaskId, long checkpointId) {
+        String getTransactionalId(int oldSubtaskId, long checkpointId) {
             return TransactionalIdFactory.buildTransactionalId(prefix, oldSubtaskId, checkpointId);
         }
     }

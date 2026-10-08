@@ -583,6 +583,18 @@ KafkaRecordSerializationSchema.builder() \
   完成时才会可见，因此请按需调整 checkpoint 的间隔。请确认事务 ID 的前缀（transactionIdPrefix）对不同的应用是唯一的，以保证不同作业的事务
   不会互相影响！此外，强烈建议将 Kafka 的事务超时时间调整至远大于 checkpoint 最大间隔 + 最大重启时间，否则 Kafka 对未提交事务的过期处理会导致数据丢失。
 
+#### 中止上一次执行遗留的事务
+
+精确一次的 ```KafkaSink``` 在恢复时会先中止上一次执行遗留的未完成事务，然后再开始写入。
+```setTransactionAbortMethod(TransactionAbortMethod)``` 用于选择中止每个事务 ID 的方式：
+
+- ```TransactionAbortMethod.PRODUCER_INIT_TRANSACTIONS```（默认）：通过一个事务型 Kafka producer 隔离（fence）该事务 ID。这是以前版本的行为。
+- ```TransactionAbortMethod.ADMIN_FENCE_PRODUCERS```：通过一个共享的 admin 客户端（```Admin#fenceProducers```）隔离该事务 ID。
+  中止过程中不会创建或重新配置任何 producer。所需的事务 ID 权限与默认方式相同；与默认方式一样，每次隔离请求的耗时上限为 producer 的 ```max.block.ms```。
+
+两种方式向事务协调者发送相同的请求，并中止相同的事务集合。sink 会以 INFO 级别记录被隔离的事务 ID 数量和中止阶段的耗时，
+并以 DEBUG 级别记录每一次隔离请求，因此可以在你的集群上比较两种方式。
+
 ### 监控
 
 Kafka sink 会在不同的[范围（Scope）]({{< ref "docs/ops/metrics" >}}/#scope)中汇报下列指标。

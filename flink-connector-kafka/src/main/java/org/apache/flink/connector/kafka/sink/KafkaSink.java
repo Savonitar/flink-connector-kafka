@@ -85,18 +85,21 @@ public class KafkaSink<IN>
     private final Properties kafkaProducerConfig;
     private final String transactionalIdPrefix;
     private final TransactionNamingStrategy transactionNamingStrategy;
+    private final TransactionAbortMethod transactionAbortMethod;
 
     KafkaSink(
             DeliveryGuarantee deliveryGuarantee,
             Properties kafkaProducerConfig,
             String transactionalIdPrefix,
             KafkaRecordSerializationSchema<IN> recordSerializer,
-            TransactionNamingStrategy transactionNamingStrategy) {
+            TransactionNamingStrategy transactionNamingStrategy,
+            TransactionAbortMethod transactionAbortMethod) {
         this.deliveryGuarantee = deliveryGuarantee;
         this.kafkaProducerConfig = kafkaProducerConfig;
         this.transactionalIdPrefix = transactionalIdPrefix;
         this.recordSerializer = recordSerializer;
         this.transactionNamingStrategy = transactionNamingStrategy;
+        this.transactionAbortMethod = transactionAbortMethod;
     }
 
     /**
@@ -152,6 +155,7 @@ public class KafkaSink<IN>
                             context.asSerializationSchemaInitializationContext(),
                             transactionNamingStrategy.getAbortImpl(),
                             transactionNamingStrategy.getImpl(),
+                            transactionAbortMethod,
                             recoveredState);
         } else {
             writer =
@@ -191,6 +195,11 @@ public class KafkaSink<IN>
     @VisibleForTesting
     protected Properties getKafkaProducerConfig() {
         return kafkaProducerConfig;
+    }
+
+    @Internal
+    TransactionAbortMethod getTransactionAbortMethod() {
+        return transactionAbortMethod;
     }
 
     @Override

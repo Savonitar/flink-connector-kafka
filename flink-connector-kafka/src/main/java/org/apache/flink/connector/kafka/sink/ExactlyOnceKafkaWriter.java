@@ -25,14 +25,17 @@ import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.connector.kafka.lineage.KafkaDatasetFacet;
 import org.apache.flink.connector.kafka.lineage.KafkaDatasetFacetProvider;
 import org.apache.flink.connector.kafka.lineage.KafkaDatasetIdentifier;
+import org.apache.flink.connector.kafka.sink.internal.AdminFencingTransactionAborter;
 import org.apache.flink.connector.kafka.sink.internal.BackchannelFactory;
 import org.apache.flink.connector.kafka.sink.internal.CheckpointTransaction;
 import org.apache.flink.connector.kafka.sink.internal.FlinkKafkaInternalProducer;
+import org.apache.flink.connector.kafka.sink.internal.ProducerFencingTransactionAborter;
 import org.apache.flink.connector.kafka.sink.internal.ProducerPool;
 import org.apache.flink.connector.kafka.sink.internal.ProducerPoolImpl;
 import org.apache.flink.connector.kafka.sink.internal.ReadableBackchannel;
 import org.apache.flink.connector.kafka.sink.internal.TransactionAbortStrategyContextImpl;
 import org.apache.flink.connector.kafka.sink.internal.TransactionAbortStrategyImpl;
+import org.apache.flink.connector.kafka.sink.internal.TransactionAborter;
 import org.apache.flink.connector.kafka.sink.internal.TransactionFinished;
 import org.apache.flink.connector.kafka.sink.internal.TransactionNamingStrategyContextImpl;
 import org.apache.flink.connector.kafka.sink.internal.TransactionNamingStrategyImpl;
@@ -49,6 +52,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -56,6 +60,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.util.IOUtils.closeAll;
@@ -70,6 +75,13 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
     private static final Logger LOG = LoggerFactory.getLogger(ExactlyOnceKafkaWriter.class);
 
     /**
+     * Bounds closing the admin client, which has nothing in flight by then. Not {@link
+     * Duration#ZERO}: {@code KafkaAdminClient#close} joins its I/O thread with this timeout, and a
+     * join of 0 waits forever, for example while the thread is stuck in a DNS lookup.
+     */
+    private static final Duration ADMIN_CLIENT_CLOSE_TIMEOUT = Duration.ofMillis(1);
+
+    /**
      * Prefix for the transactional id. Must be unique across all sinks writing to the same broker.
      */
     private final String transactionalIdPrefix;
@@ -82,6 +94,9 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
 
     /** Strategy to name transactions. */
     private final TransactionNamingStrategyImpl transactionNamingStrategy;
+
+    /** Method to abort a single transactional id in {@link #abortLingeringTransactions}. */
+    private final TransactionAbortMethod transactionAbortMethod;
 
     private final Collection<KafkaWriterState> recoveredStates;
     private final long restoredCheckpointId;
@@ -106,7 +121,10 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
     private final int totalNumberOfOwnedSubtasks;
     private final int[] ownedSubtaskIds;
 
-    /** Lazily created admin client for {@link TransactionAbortStrategyImpl}. */
+    /**
+     * Admin client of {@link #abortLingeringTransactions}, created on first use and closed when the
+     * sweep ends.
+     */
     private AdminClient adminClient;
 
     /**
@@ -133,6 +151,7 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
             SerializationSchema.InitializationContext schemaContext,
             TransactionAbortStrategyImpl transactionAbortStrategy,
             TransactionNamingStrategyImpl transactionNamingStrategy,
+            TransactionAbortMethod transactionAbortMethod,
             Collection<KafkaWriterState> recoveredStates) {
         super(
                 deliveryGuarantee,
@@ -147,6 +166,8 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
         this.transactionNamingStrategy =
                 checkNotNull(
                         transactionNamingStrategy, "transactionNamingStrategy must not be null");
+        this.transactionAbortMethod =
+                checkNotNull(transactionAbortMethod, "transactionAbortMethod must not be null");
 
         try {
             recordSerializer.open(schemaContext, kafkaSinkContext);
@@ -273,6 +294,7 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
                 this::abortCurrentProducer,
                 () -> closeAll(producerPool),
                 backchannel,
+                this::closeAdminClient,
                 super::close);
     }
 
@@ -323,28 +345,45 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
         }
 
         LOG.info(
-                "Aborting lingering transactions with prefixes {} using {}",
+                "Aborting lingering transactions with prefixes {} using {} with abortMethod={}",
                 prefixesToAbort,
-                transactionAbortStrategy);
-        TransactionAbortStrategyContextImpl context =
-                getTransactionAbortStrategyContext(startCheckpointId, prefixesToAbort);
-        transactionAbortStrategy.abortTransactions(context);
+                transactionAbortStrategy,
+                transactionAbortMethod);
+        final long startNanos = System.nanoTime();
+        final int numFenced;
+        try {
+            TransactionAbortStrategyContextImpl context =
+                    getTransactionAbortStrategyContext(
+                            startCheckpointId, prefixesToAbort, createTransactionAborter());
+            numFenced = transactionAbortStrategy.abortTransactions(context);
+        } finally {
+            closeAdminClient();
+        }
+        LOG.info(
+                "Aborted lingering transactions with prefixes {} using {} with abortMethod={} in {} ms: fenced {} transactional ids",
+                prefixesToAbort,
+                transactionAbortStrategy,
+                transactionAbortMethod,
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos),
+                numFenced);
+    }
+
+    private TransactionAborter createTransactionAborter() {
+        switch (transactionAbortMethod) {
+            case PRODUCER_INIT_TRANSACTIONS:
+                return new ProducerFencingTransactionAborter(producerPool);
+            case ADMIN_FENCE_PRODUCERS:
+                return new AdminFencingTransactionAborter(
+                        this::getAdminClient,
+                        AdminFencingTransactionAborter.fenceTimeoutMs(kafkaProducerConfig));
+            default:
+                throw new IllegalArgumentException(
+                        "Unknown transaction abort method " + transactionAbortMethod);
+        }
     }
 
     private TransactionAbortStrategyContextImpl getTransactionAbortStrategyContext(
-            long startCheckpointId, List<String> prefixesToAbort) {
-        TransactionAbortStrategyImpl.TransactionAborter aborter =
-                transactionalId -> {
-                    // getTransactionalProducer already calls initTransactions, which cancels the
-                    // transaction
-                    FlinkKafkaInternalProducer<byte[], byte[]> producer =
-                            producerPool.getTransactionalProducer(transactionalId, 0);
-                    LOG.debug("Aborting transaction {}", transactionalId);
-                    producer.flush();
-                    short epoch = producer.getEpoch();
-                    producerPool.recycle(producer);
-                    return epoch;
-                };
+            long startCheckpointId, List<String> prefixesToAbort, TransactionAborter aborter) {
         Set<String> precommittedTransactionalIds =
                 recoveredStates.stream()
                         .flatMap(
@@ -393,5 +432,12 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
             adminClient = AdminClient.create(kafkaProducerConfig);
         }
         return adminClient;
+    }
+
+    private void closeAdminClient() {
+        if (adminClient != null) {
+            adminClient.close(ADMIN_CLIENT_CLOSE_TIMEOUT);
+            adminClient = null;
+        }
     }
 }

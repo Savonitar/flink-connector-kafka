@@ -19,7 +19,6 @@
 package org.apache.flink.connector.kafka.sink.internal;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.connector.kafka.sink.internal.TransactionAbortStrategyImpl.TransactionAborter;
 import org.apache.flink.connector.kafka.util.AdminUtils;
 
 import org.apache.kafka.clients.admin.Admin;

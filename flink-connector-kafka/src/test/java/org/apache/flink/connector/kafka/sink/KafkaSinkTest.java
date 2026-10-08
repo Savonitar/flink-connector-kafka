@@ -69,7 +69,8 @@ public class KafkaSinkTest {
                         new Properties(),
                         "",
                         recordSerializer,
-                        TransactionNamingStrategy.DEFAULT);
+                        TransactionNamingStrategy.DEFAULT,
+                        TransactionAbortMethod.DEFAULT);
 
         assertThat(sink.getLineageVertex().datasets()).isEmpty();
     }
@@ -85,7 +86,8 @@ public class KafkaSinkTest {
                         new Properties(),
                         "",
                         recordSerializer,
-                        TransactionNamingStrategy.DEFAULT);
+                        TransactionNamingStrategy.DEFAULT,
+                        TransactionAbortMethod.DEFAULT);
 
         assertThat(sink.getLineageVertex().datasets()).isEmpty();
     }
@@ -101,7 +103,8 @@ public class KafkaSinkTest {
                         kafkaProperties,
                         "",
                         recordSerializer,
-                        TransactionNamingStrategy.DEFAULT);
+                        TransactionNamingStrategy.DEFAULT,
+                        TransactionAbortMethod.DEFAULT);
 
         LineageVertex lineageVertex = sink.getLineageVertex();
 

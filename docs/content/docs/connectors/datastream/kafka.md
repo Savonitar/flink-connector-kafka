@@ -677,6 +677,24 @@ an explanation of the different guarantees.
   transaction.timeout.ms)>> maximum checkpoint duration + maximum restart duration or data loss may
   happen when Kafka expires an uncommitted transaction. 
 
+#### Aborting transactions of a previous execution
+
+On recovery, an exactly-once ```KafkaSink``` aborts the transactions that the previous execution
+left open before it starts writing. ```setTransactionAbortMethod(TransactionAbortMethod)``` selects
+how each transactional id is aborted:
+
+- ```TransactionAbortMethod.PRODUCER_INIT_TRANSACTIONS``` (default): fences the transactional id
+  through a transactional Kafka producer. This is the behavior of previous versions.
+- ```TransactionAbortMethod.ADMIN_FENCE_PRODUCERS```: fences the transactional id through one shared
+  admin client (```Admin#fenceProducers```). No producer is created or reconfigured while aborting.
+  It requires the same permissions on the transactional ids as the default and, like the default,
+  bounds each fence request by the producer's ```max.block.ms```.
+
+Both methods send the same request to the transaction coordinator and abort the same set of
+transactions. The sink logs the number of fenced transactional ids and the duration of the abort
+phase at INFO level and every single fence request at DEBUG level, so the two methods can be
+compared on your cluster.
+
 ### Monitoring
 
 Kafka sink exposes the following metrics in the respective [scope]({{< ref "docs/ops/metrics" >}}/#scope).

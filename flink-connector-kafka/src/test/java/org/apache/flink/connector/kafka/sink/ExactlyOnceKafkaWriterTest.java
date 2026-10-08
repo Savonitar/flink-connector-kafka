@@ -83,6 +83,7 @@ class ExactlyOnceKafkaWriterTest {
                 null,
                 TransactionAbortStrategyImpl.PROBING,
                 TransactionNamingStrategyImpl.INCREMENTING,
+                TransactionAbortMethod.DEFAULT,
                 List.of());
     }
 

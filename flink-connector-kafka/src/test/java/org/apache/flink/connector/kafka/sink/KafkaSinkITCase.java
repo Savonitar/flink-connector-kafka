@@ -89,7 +89,6 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
-import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.GenericContainer;
@@ -277,30 +276,76 @@ class KafkaSinkITCase {
                                         .map(chained -> Arguments.of(strategy, chained)));
     }
 
+    static Stream<Arguments> getAbortParameters() {
+        return getEOSParameters()
+                .flatMap(
+                        eosArguments ->
+                                Arrays.stream(TransactionAbortMethod.values())
+                                        .map(
+                                                abortMethod ->
+                                                        Arguments.of(
+                                                                eosArguments.get()[0],
+                                                                eosArguments.get()[1],
+                                                                abortMethod)));
+    }
+
+    /**
+     * The rows of {@link #getEOSParameters()} with one abort method each, so that every naming
+     * strategy and every chaining mode runs under both methods without doubling the rows.
+     */
+    static Stream<Arguments> getAlternatingAbortParameters() {
+        return Stream.of(
+                Arguments.of(
+                        TransactionNamingStrategy.INCREMENTING,
+                        true,
+                        TransactionAbortMethod.PRODUCER_INIT_TRANSACTIONS),
+                Arguments.of(
+                        TransactionNamingStrategy.INCREMENTING,
+                        false,
+                        TransactionAbortMethod.ADMIN_FENCE_PRODUCERS),
+                Arguments.of(
+                        TransactionNamingStrategy.POOLING,
+                        true,
+                        TransactionAbortMethod.ADMIN_FENCE_PRODUCERS),
+                Arguments.of(
+                        TransactionNamingStrategy.POOLING,
+                        false,
+                        TransactionAbortMethod.PRODUCER_INIT_TRANSACTIONS));
+    }
+
     @Test
     void testRecoveryWithAtLeastOnceGuarantee() throws Exception {
         testRecoveryWithAssertion(DeliveryGuarantee.AT_LEAST_ONCE, 1);
     }
 
-    @ParameterizedTest(name = "{0}, chained={1}")
-    @MethodSource("getEOSParameters")
+    @ParameterizedTest(name = "{0}, chained={1}, abortMethod={2}")
+    @MethodSource("getAlternatingAbortParameters")
     public void testRecoveryWithExactlyOnceGuarantee(
-            TransactionNamingStrategy namingStrategy, boolean chained) throws Exception {
-        testRecoveryWithAssertion(DeliveryGuarantee.EXACTLY_ONCE, 1, namingStrategy, chained);
+            TransactionNamingStrategy namingStrategy,
+            boolean chained,
+            TransactionAbortMethod abortMethod)
+            throws Exception {
+        testRecoveryWithAssertion(
+                DeliveryGuarantee.EXACTLY_ONCE, 1, namingStrategy, chained, abortMethod);
     }
 
-    @ParameterizedTest(name = "{0}, chained={1}")
-    @MethodSource("getEOSParameters")
+    @ParameterizedTest(name = "{0}, chained={1}, abortMethod={2}")
+    @MethodSource("getAlternatingAbortParameters")
     public void testRecoveryWithExactlyOnceGuaranteeAndConcurrentCheckpoints(
-            TransactionNamingStrategy namingStrategy, boolean chained) throws Exception {
-        testRecoveryWithAssertion(DeliveryGuarantee.EXACTLY_ONCE, 2, namingStrategy, chained);
+            TransactionNamingStrategy namingStrategy,
+            boolean chained,
+            TransactionAbortMethod abortMethod)
+            throws Exception {
+        testRecoveryWithAssertion(
+                DeliveryGuarantee.EXACTLY_ONCE, 2, namingStrategy, chained, abortMethod);
     }
 
-    @ParameterizedTest(name = "{0}, chained={1}")
-    @MethodSource("getEOSParameters")
+    @ParameterizedTest(name = "{0}, chained={1}, abortMethod={2}")
+    @MethodSource("getAbortParameters")
     public void testAbortTransactionsOfPendingCheckpointsAfterFailure(
             TransactionNamingStrategy namingStrategy,
             boolean chained,
+            TransactionAbortMethod abortMethod,
             @TempDir File checkpointDir,
             @InjectMiniCluster MiniCluster miniCluster,
             @InjectClusterClient ClusterClient<?> clusterClient)
@@ -325,6 +370,7 @@ class KafkaSinkITCase {
                             config,
                             namingStrategy,
                             chained,
+                            abortMethod,
                             "firstPrefix",
                             clusterClient);
         } catch (Exception e) {
@@ -341,6 +387,7 @@ class KafkaSinkITCase {
                 config,
                 namingStrategy,
                 chained,
+                abortMethod,
                 "newPrefix",
                 clusterClient);
         final List<Long> committedRecords =
@@ -348,11 +395,12 @@ class KafkaSinkITCase {
         assertThat(committedRecords).containsExactlyInAnyOrderElementsOf(checkpointedRecords.get());
     }
 
-    @ParameterizedTest(name = "{0}, chained={1}")
-    @MethodSource("getEOSParameters")
+    @ParameterizedTest(name = "{0}, chained={1}, abortMethod={2}")
+    @MethodSource("getAbortParameters")
     public void testAbortTransactionsAfterScaleInBeforeFirstCheckpoint(
             TransactionNamingStrategy namingStrategy,
             boolean chained,
+            TransactionAbortMethod abortMethod,
             @InjectClusterClient ClusterClient<?> clusterClient)
             throws Exception {
         // Run a first job opening 5 transactions one per subtask and fail in async checkpoint phase
@@ -366,6 +414,7 @@ class KafkaSinkITCase {
                     config,
                     namingStrategy,
                     chained,
+                    abortMethod,
                     null,
                     clusterClient);
         } catch (Exception e) {
@@ -385,6 +434,7 @@ class KafkaSinkITCase {
                 config,
                 namingStrategy,
                 chained,
+                abortMethod,
                 null,
                 clusterClient);
         final List<Long> committedRecords =
@@ -392,11 +442,23 @@ class KafkaSinkITCase {
         assertThat(committedRecords).containsExactlyInAnyOrderElementsOf(checkpointedRecords.get());
     }
 
-    @ParameterizedTest(name = "{0}->{1}")
-    @CsvSource({"1,2", "2,3", "2,5", "3,5", "5,6", "6,5", "5,2", "5,3", "3,2", "2,1"})
+    @ParameterizedTest(name = "{0}->{1}, abortMethod={2}")
+    @CsvSource({
+        "1,2,PRODUCER_INIT_TRANSACTIONS",
+        "2,3,ADMIN_FENCE_PRODUCERS",
+        "2,5,PRODUCER_INIT_TRANSACTIONS",
+        "3,5,ADMIN_FENCE_PRODUCERS",
+        "5,6,PRODUCER_INIT_TRANSACTIONS",
+        "6,5,ADMIN_FENCE_PRODUCERS",
+        "5,2,PRODUCER_INIT_TRANSACTIONS",
+        "5,3,ADMIN_FENCE_PRODUCERS",
+        "3,2,PRODUCER_INIT_TRANSACTIONS",
+        "2,1,ADMIN_FENCE_PRODUCERS"
+    })
     public void rescaleListing(
             int oldParallelism,
             int newParallelsm,
+            TransactionAbortMethod abortMethod,
             @TempDir File checkpointDir,
             @InjectMiniCluster MiniCluster miniCluster,
             @InjectClusterClient ClusterClient<?> clusterClient)
@@ -420,6 +482,7 @@ class KafkaSinkITCase {
                         config,
                         TransactionNamingStrategy.POOLING,
                         false,
+                        abortMethod,
                         "firstPrefix",
                         clusterClient);
 
@@ -435,6 +498,7 @@ class KafkaSinkITCase {
                         config,
                         TransactionNamingStrategy.POOLING,
                         false,
+                        abortMethod,
                         "secondPrefix",
                         clusterClient);
 
@@ -448,6 +512,7 @@ class KafkaSinkITCase {
                 config,
                 TransactionNamingStrategy.POOLING,
                 false,
+                abortMethod,
                 "thirdPrefix",
                 clusterClient);
 
@@ -480,10 +545,22 @@ class KafkaSinkITCase {
         return completedCheckpoint.get();
     }
 
-    @ParameterizedTest
-    @ValueSource(booleans = {true, false})
+    static Stream<Arguments> getMigrationParameters() {
+        return Stream.of(true, false)
+                .flatMap(
+                        supportedMigration ->
+                                Arrays.stream(TransactionAbortMethod.values())
+                                        .map(
+                                                abortMethod ->
+                                                        Arguments.of(
+                                                                supportedMigration, abortMethod)));
+    }
+
+    @ParameterizedTest(name = "supportedMigration={0}, abortMethod={1}")
+    @MethodSource("getMigrationParameters")
     public void checkMigration(
             boolean supportedMigration,
+            TransactionAbortMethod abortMethod,
             @TempDir File checkpointDir,
             @InjectMiniCluster MiniCluster miniCluster,
             @InjectClusterClient ClusterClient<?> clusterClient)
@@ -507,6 +584,7 @@ class KafkaSinkITCase {
                         config,
                         TransactionNamingStrategy.INCREMENTING,
                         true,
+                        abortMethod,
                         "firstPrefix",
                         clusterClient);
 
@@ -520,6 +598,7 @@ class KafkaSinkITCase {
                         config,
                         TransactionNamingStrategy.POOLING,
                         true,
+                        abortMethod,
                         "secondPrefix",
                         clusterClient);
 
@@ -535,6 +614,7 @@ class KafkaSinkITCase {
                                 ? TransactionNamingStrategy.POOLING
                                 : TransactionNamingStrategy.INCREMENTING,
                         true,
+                        abortMethod,
                         "thirdPrefix",
                         clusterClient);
 
@@ -558,6 +638,65 @@ class KafkaSinkITCase {
                     .hasMessageContaining(
                             "Attempted to switch the transaction naming strategy back to INCREMENTING");
         }
+    }
+
+    /**
+     * The abort method is not part of the sink state, so a job restored under the other method must
+     * clean up what the previous run left open.
+     */
+    @ParameterizedTest(name = "{0} -> {1}")
+    @CsvSource({
+        "ADMIN_FENCE_PRODUCERS, PRODUCER_INIT_TRANSACTIONS",
+        "PRODUCER_INIT_TRANSACTIONS, ADMIN_FENCE_PRODUCERS"
+    })
+    public void switchesTransactionAbortMethodBetweenRuns(
+            TransactionAbortMethod firstMethod,
+            TransactionAbortMethod secondMethod,
+            @TempDir File checkpointDir,
+            @InjectMiniCluster MiniCluster miniCluster,
+            @InjectClusterClient ClusterClient<?> clusterClient)
+            throws Exception {
+        // the first run fails during the async phase of a checkpoint and leaves transactions open
+        final Configuration config = createConfiguration(4);
+        config.set(StateBackendOptions.STATE_BACKEND, "rocksdb");
+        config.set(CheckpointingOptions.CHECKPOINTS_DIRECTORY, checkpointDir.toURI().toString());
+        config.set(
+                CheckpointingOptions.EXTERNALIZED_CHECKPOINT_RETENTION,
+                ExternalizedCheckpointRetention.RETAIN_ON_CANCELLATION);
+        config.set(CheckpointingOptions.MAX_RETAINED_CHECKPOINTS, 2);
+        SharedReference<Set<Long>> checkpointedRecords =
+                sharedObjects.add(new ConcurrentSkipListSet<>());
+        JobID firstJobId = null;
+        try {
+            firstJobId =
+                    executeWithMapper(
+                            new FailAsyncCheckpointMapper(1),
+                            checkpointedRecords,
+                            config,
+                            TransactionNamingStrategy.DEFAULT,
+                            true,
+                            firstMethod,
+                            "switchPrefix",
+                            clusterClient);
+        } catch (Exception e) {
+            assertThat(e).hasStackTraceContaining("Exceeded checkpoint tolerable failure");
+        }
+        config.set(SAVEPOINT_PATH, waitForCompletedCheckpointPath(miniCluster, firstJobId));
+
+        // the second run restores under the other method, with the same transactional id prefix
+        SharedReference<AtomicBoolean> failed = sharedObjects.add(new AtomicBoolean(true));
+        executeWithMapper(
+                new FailingCheckpointMapper(failed),
+                checkpointedRecords,
+                config,
+                TransactionNamingStrategy.DEFAULT,
+                true,
+                secondMethod,
+                "switchPrefix",
+                clusterClient);
+        final List<Long> committedRecords =
+                deserializeValues(drainAllRecordsFromTopic(topic, true));
+        assertThat(committedRecords).containsExactlyInAnyOrderElementsOf(checkpointedRecords.get());
     }
 
     @ParameterizedTest
@@ -599,6 +738,27 @@ class KafkaSinkITCase {
             @Nullable String transactionalIdPrefix,
             ClusterClient<?> clusterClient)
             throws Exception {
+        return executeWithMapper(
+                mapper,
+                checkpointedRecords,
+                config,
+                namingStrategy,
+                chained,
+                TransactionAbortMethod.DEFAULT,
+                transactionalIdPrefix,
+                clusterClient);
+    }
+
+    private JobID executeWithMapper(
+            MapFunction<Long, Long> mapper,
+            SharedReference<Set<Long>> checkpointedRecords,
+            Configuration config,
+            TransactionNamingStrategy namingStrategy,
+            boolean chained,
+            TransactionAbortMethod abortMethod,
+            @Nullable String transactionalIdPrefix,
+            ClusterClient<?> clusterClient)
+            throws Exception {
 
         config.set(RestartStrategyOptions.RESTART_STRATEGY, "disable");
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(config);
@@ -618,7 +778,8 @@ class KafkaSinkITCase {
                                         .setTopic(topic)
                                         .setValueSerializationSchema(new RecordSerializer())
                                         .build())
-                        .setTransactionNamingStrategy(namingStrategy);
+                        .setTransactionNamingStrategy(namingStrategy)
+                        .setTransactionAbortMethod(abortMethod);
         if (transactionalIdPrefix == null) {
             transactionalIdPrefix = "kafka-sink";
         }
@@ -633,14 +794,19 @@ class KafkaSinkITCase {
     private void testRecoveryWithAssertion(
             DeliveryGuarantee guarantee, int maxConcurrentCheckpoints) throws Exception {
         testRecoveryWithAssertion(
-                guarantee, maxConcurrentCheckpoints, TransactionNamingStrategy.DEFAULT, true);
+                guarantee,
+                maxConcurrentCheckpoints,
+                TransactionNamingStrategy.DEFAULT,
+                true,
+                TransactionAbortMethod.DEFAULT);
     }
 
     private void testRecoveryWithAssertion(
             DeliveryGuarantee guarantee,
             int maxConcurrentCheckpoints,
             TransactionNamingStrategy namingStrategy,
-            boolean chained)
+            boolean chained,
+            TransactionAbortMethod abortMethod)
             throws Exception {
         final StreamExecutionEnvironment env =
                 StreamExecutionEnvironment.getExecutionEnvironment(createConfiguration(1));
@@ -667,6 +833,7 @@ class KafkaSinkITCase {
                                         .build())
                         .setTransactionalIdPrefix("kafka-sink")
                         .setTransactionNamingStrategy(namingStrategy)
+                        .setTransactionAbortMethod(abortMethod)
                         .build());
         env.execute();
 
