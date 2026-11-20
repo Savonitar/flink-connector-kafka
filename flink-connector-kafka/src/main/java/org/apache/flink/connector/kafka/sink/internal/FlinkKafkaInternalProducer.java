@@ -25,8 +25,10 @@ import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.clients.producer.internals.ProducerMetadata;
 import org.apache.kafka.clients.producer.internals.TransactionManager;
 import org.apache.kafka.clients.producer.internals.TransactionalRequestResult;
+import org.apache.kafka.common.errors.InterruptException;
 import org.apache.kafka.common.errors.ProducerFencedException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -57,6 +59,7 @@ public class FlinkKafkaInternalProducer<K, V> extends KafkaProducer<K, V> {
     @Nullable private String transactionalId;
     private volatile TransactionState transactionState = TransactionState.NOT_IN_TRANSACTION;
     private volatile boolean closed;
+    private boolean transactionResumed;
 
     public FlinkKafkaInternalProducer(Properties properties) {
         super(properties);
@@ -104,6 +107,7 @@ public class FlinkKafkaInternalProducer<K, V> extends KafkaProducer<K, V> {
         LOG.debug("abortTransaction {}", transactionalId);
         checkState(isInTransaction(), "Transaction was not started");
         transactionState = TransactionState.NOT_IN_TRANSACTION;
+        adoptBrokerTransactionVersionIfResumed();
         super.abortTransaction();
     }
 
@@ -112,7 +116,47 @@ public class FlinkKafkaInternalProducer<K, V> extends KafkaProducer<K, V> {
         LOG.debug("commitTransaction {}", transactionalId);
         checkState(isInTransaction(), "Transaction was not started");
         transactionState = TransactionState.NOT_IN_TRANSACTION;
+        adoptBrokerTransactionVersionIfResumed();
         super.commitTransaction();
+    }
+
+    /**
+     * Completes, for a transaction set up by {@link #resumeTransaction}, the step of {@link
+     * #initTransactions()} that reads the transaction version of the broker.
+     *
+     * <p>The client picks the request format for ending a transaction from that version. Without
+     * it, a resumed producer uses the format of version 1. A broker on version 2 bumps the epoch
+     * when it ends a transaction, so it then rejects a repeated commit of an already committed
+     * transaction as fenced, although it accepts the same request in the format of version 2.
+     */
+    private void adoptBrokerTransactionVersionIfResumed() {
+        if (!transactionResumed) {
+            return;
+        }
+        transactionResumed = false;
+        awaitBrokerApiVersions();
+        // as on initialization: this producer has not run transactions with another version that
+        // would need an epoch bump when switching
+        ((TransactionManager) getTransactionManager()).maybeUpdateTransactionV2Enabled(true);
+    }
+
+    /**
+     * Waits until the producer has received metadata from a broker. On every new connection the
+     * client asks the broker for its API versions, which include the transaction version, before it
+     * sends any other request.
+     */
+    private void awaitBrokerApiVersions() {
+        final ProducerMetadata metadata = (ProducerMetadata) getField("metadata");
+        if (!metadata.fetch().isBootstrapConfigured()) {
+            return;
+        }
+        final int version = metadata.requestUpdate(false);
+        invoke(getField("sender"), "wakeup");
+        try {
+            metadata.awaitUpdate(version, (long) getField("maxBlockTimeMs"));
+        } catch (InterruptedException e) {
+            throw new InterruptException(e);
+        }
     }
 
     public boolean isInTransaction() {
@@ -337,6 +381,7 @@ public class FlinkKafkaInternalProducer<K, V> extends KafkaProducer<K, V> {
             setField(transactionManager, "transactionStarted", true);
         }
         this.transactionState = TransactionState.PRECOMMITTED;
+        this.transactionResumed = true;
     }
 
     private static Object createProducerIdAndEpoch(long producerId, short epoch) {

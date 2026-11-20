@@ -51,6 +51,7 @@ import java.util.Properties;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
+import static org.apache.flink.connector.kafka.testutils.DockerImageVersions.APACHE_KAFKA;
 import static org.apache.flink.connector.kafka.testutils.KafkaUtil.checkProducerLeak;
 import static org.apache.flink.connector.kafka.testutils.KafkaUtil.createKafkaContainer;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -72,6 +73,11 @@ class FlinkKafkaInternalProducerITCase {
     @Container
     private static final TestKafkaContainer KAFKA_CONTAINER =
             createKafkaContainer(FlinkKafkaInternalProducerITCase.class);
+
+    /** Runs transaction version 2 (KIP-890): ending a transaction bumps the producer epoch. */
+    @Container
+    private static final TestKafkaContainer TRANSACTION_V2_KAFKA_CONTAINER =
+            new TestKafkaContainer(APACHE_KAFKA);
 
     @AfterEach
     public void check() {
@@ -187,9 +193,61 @@ class FlinkKafkaInternalProducerITCase {
         final String transactionIdPrefix = "testDoubleCommitTransaction-";
         final String transactionalId = transactionIdPrefix + "id";
 
+        AbstractThrowableAssert<?, ? extends Throwable> secondOp =
+                assertThatEndOfResumedTransaction(
+                        getProperties(), topic, transactionalId, firstCommit, secondCommit);
+        if (firstCommit == secondCommit) {
+            secondOp.doesNotThrowAnyException();
+        } else {
+            secondOp.isInstanceOf(InvalidTxnStateException.class);
+        }
+
+        assertNumTransactions(1, transactionIdPrefix);
+        assertThat(readRecords(topic).count()).isEqualTo(firstCommit ? 1 : 0);
+    }
+
+    /**
+     * The first end of the transaction bumps the epoch, so the resumed producer ends the
+     * transaction with an epoch one below the current one, as a committer does after a recovery.
+     */
+    @ParameterizedTest
+    @CsvSource({"true,true", "true,false", "false,true", "false,false"})
+    void testDoubleCommitAndAbortWithTransactionVersion2(
+            boolean firstCommit, boolean secondCommit) {
+        final Properties properties = getProperties(TRANSACTION_V2_KAFKA_CONTAINER);
+        final String topic = "test-double-commit-transaction-v2-" + firstCommit + secondCommit;
+
+        AbstractThrowableAssert<?, ? extends Throwable> secondOp =
+                assertThatEndOfResumedTransaction(
+                        properties,
+                        topic,
+                        "testDoubleCommitTransactionV2-id",
+                        firstCommit,
+                        secondCommit);
+        if (firstCommit == secondCommit) {
+            secondOp.doesNotThrowAnyException();
+        } else {
+            // newer brokers answer a commit after an abort with PRODUCER_FENCED (KAFKA-20785)
+            secondOp.isInstanceOfAny(InvalidTxnStateException.class, ProducerFencedException.class);
+        }
+
+        assertThat(readRecords(properties, topic).count()).isEqualTo(firstCommit ? 1 : 0);
+    }
+
+    /**
+     * Ends a transaction with the producer that wrote it, then ends it once more with a new
+     * producer that resumes it from the committable.
+     */
+    private static AbstractThrowableAssert<?, ? extends Throwable>
+            assertThatEndOfResumedTransaction(
+                    Properties properties,
+                    String topic,
+                    String transactionalId,
+                    boolean firstCommit,
+                    boolean secondCommit) {
         KafkaCommittable committable;
         try (FlinkKafkaInternalProducer<String, String> producer =
-                new FlinkKafkaInternalProducer<>(getProperties(), transactionalId)) {
+                new FlinkKafkaInternalProducer<>(properties, transactionalId)) {
             producer.initTransactions();
             producer.beginTransaction();
             producer.send(new ProducerRecord<>(topic, "test-value"));
@@ -203,33 +261,26 @@ class FlinkKafkaInternalProducerITCase {
         }
 
         try (FlinkKafkaInternalProducer<String, String> resumedProducer =
-                new FlinkKafkaInternalProducer<>(getProperties(), transactionalId)) {
+                new FlinkKafkaInternalProducer<>(properties, transactionalId)) {
             resumedProducer.resumeTransaction(committable.getProducerId(), committable.getEpoch());
-            AbstractThrowableAssert<?, ? extends Throwable> secondOp =
-                    assertThatCode(
-                            () -> {
-                                if (secondCommit) {
-                                    resumedProducer.commitTransaction();
-                                } else {
-                                    resumedProducer.abortTransaction();
-                                }
-                            });
-            if (firstCommit == secondCommit) {
-                secondOp.doesNotThrowAnyException();
-            } else {
-                secondOp.isInstanceOf(InvalidTxnStateException.class);
-            }
+            return assertThatCode(
+                    () -> {
+                        if (secondCommit) {
+                            resumedProducer.commitTransaction();
+                        } else {
+                            resumedProducer.abortTransaction();
+                        }
+                    });
         }
-
-        assertNumTransactions(1, transactionIdPrefix);
-        assertThat(readRecords(topic).count()).isEqualTo(firstCommit ? 1 : 0);
     }
 
     private static Properties getProperties() {
+        return getProperties(KAFKA_CONTAINER);
+    }
+
+    private static Properties getProperties(TestKafkaContainer kafka) {
         Properties properties = new Properties();
-        properties.put(
-                CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG,
-                KAFKA_CONTAINER.getBootstrapServers());
+        properties.put(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers());
         properties.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
         properties.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
         properties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
@@ -256,7 +307,13 @@ class FlinkKafkaInternalProducerITCase {
     }
 
     private ConsumerRecords<String, String> readRecords(String topic) {
-        Properties properties = getProperties();
+        return readRecords(getProperties(), topic);
+    }
+
+    private static ConsumerRecords<String, String> readRecords(
+            Properties kafkaProperties, String topic) {
+        Properties properties = new Properties();
+        properties.putAll(kafkaProperties);
         properties.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
         KafkaConsumer<String, String> consumer = new KafkaConsumer<>(properties);
         consumer.assign(
