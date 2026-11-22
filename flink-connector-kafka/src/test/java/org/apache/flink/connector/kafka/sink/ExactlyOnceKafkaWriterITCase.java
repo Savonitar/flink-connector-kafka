@@ -17,27 +17,34 @@
 
 package org.apache.flink.connector.kafka.sink;
 
+import org.apache.flink.api.common.TaskInfo;
+import org.apache.flink.api.connector.sink2.mocks.MockCommitRequest;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.connector.kafka.sink.internal.CheckpointTransaction;
 import org.apache.flink.connector.kafka.sink.internal.FlinkKafkaInternalProducer;
+import org.apache.flink.connector.kafka.sink.internal.KafkaCommitter;
 import org.apache.flink.connector.kafka.sink.internal.ProducerPoolImpl;
 import org.apache.flink.connector.kafka.sink.internal.TransactionFinished;
 import org.apache.flink.connector.kafka.sink.internal.TransactionOwnership;
 import org.apache.flink.connector.kafka.sink.internal.WritableBackchannel;
 import org.apache.flink.connector.kafka.util.AdminUtils;
+import org.apache.flink.connector.testutils.source.TestingTaskInfo;
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.groups.SinkWriterMetricGroup;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.test.junit5.MiniClusterExtension;
+import org.apache.flink.util.ExceptionUtils;
 
 import com.google.common.collect.Iterables;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.errors.InterruptException;
 import org.apache.kafka.common.errors.ProducerFencedException;
+import org.apache.kafka.common.errors.RetriableException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -55,6 +62,7 @@ import java.util.function.Consumer;
 
 import static org.apache.flink.connector.kafka.sink.internal.TransactionalIdFactory.buildTransactionalId;
 import static org.apache.flink.connector.kafka.testutils.KafkaUtil.drainAllRecordsFromTopic;
+import static org.apache.flink.connector.kafka.testutils.KafkaUtil.waitUntilNoTransactionIsOpen;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.AssertionsForClassTypes.assertThatCode;
@@ -279,6 +287,75 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
         }
     }
 
+    /**
+     * Tests that a writer of an earlier attempt does not end the transaction that the writer of a
+     * later attempt of the same subtask has pre-committed, when the earlier writer is created only
+     * after the pre-commit. The earlier writer may start or refuse to start; the test accepts both.
+     *
+     * <p>KNOWN, OPEN DEFECT: this test is expected to fail until writers of different attempts of a
+     * subtask can no longer end each other's transactions.
+     */
+    @ParameterizedTest
+    @EnumSource(TransactionNamingStrategy.class)
+    void shouldNotAbortPrecommittedTransactionOfLaterAttempt(
+            TransactionNamingStrategy namingStrategy) throws Exception {
+        // both attempts run the same sink, so they share the prefix and the subtask id
+        final String prefix = getTransactionalPrefix();
+        final Consumer<KafkaSinkBuilder<?>> sink =
+                builder ->
+                        builder.setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+                                .setTransactionNamingStrategy(namingStrategy)
+                                .setTransactionalIdPrefix(prefix);
+        final int earlierAttempt = 0;
+        final int laterAttempt = 1;
+
+        try (final ExactlyOnceKafkaWriter<Integer> laterWriter =
+                        createWriter(sink, createInitContext(laterAttempt));
+                final KafkaCommitter committer =
+                        new KafkaCommitter(
+                                getKafkaClientConfiguration(),
+                                prefix,
+                                0,
+                                laterAttempt,
+                                namingStrategy == TransactionNamingStrategy.POOLING,
+                                FlinkKafkaInternalProducer::new)) {
+            final KafkaCommittable precommitted = onCheckpointBarrier(laterWriter, 1).f1;
+
+            // the earlier attempt is still alive and gets to create its writer only now
+            ExactlyOnceKafkaWriter<Integer> earlierWriter = null;
+            try {
+                try {
+                    earlierWriter = createWriter(sink, createInitContext(earlierAttempt));
+                } catch (Exception e) {
+                    // A writer that notices the later attempt and does not start is fine as well.
+                    // A broker that did not answer in time is not such a refusal: the transaction
+                    // of the later attempt would survive, and the test would pass for no reason.
+                    if (ExceptionUtils.findThrowable(e, RetriableException.class).isPresent()
+                            || ExceptionUtils.findThrowable(e, InterruptException.class)
+                                    .isPresent()) {
+                        throw e;
+                    }
+                    LOG.info("The writer of the earlier attempt did not start.", e);
+                }
+                committer.commit(List.of(new MockCommitRequest<>(precommitted)));
+            } finally {
+                if (earlierWriter != null) {
+                    earlierWriter.close();
+                }
+            }
+
+            // the broker ends a transaction in the partition after it has answered the producer
+            waitUntilNoTransactionIsOpen(topic, getKafkaClientConfiguration());
+            assertThat(drainAllRecordsFromTopic(topic, getKafkaClientConfiguration(), true))
+                    .as(
+                            "KNOWN, OPEN DEFECT - this failure is expected until it is fixed: "
+                                    + "the writer of the earlier attempt ended the transaction "
+                                    + "that the later attempt had pre-committed, so the record "
+                                    + "of the later attempt is not committed")
+                    .hasSize(1);
+        }
+    }
+
     /** Test that producers are reused when committed. */
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
@@ -474,6 +551,23 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
                         builder.setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
                                 .setTransactionNamingStrategy(namingStrategy),
                 createInitContext());
+    }
+
+    private SinkInitContext createInitContext(int attemptNumber) {
+        final TaskInfo taskInfo =
+                new TestingTaskInfo.Builder()
+                        .setTaskName("TestTask")
+                        .setMaxNumberOfParallelSubtasks(1)
+                        .setIndexOfThisSubtask(0)
+                        .setAttemptNumber(attemptNumber)
+                        .setNumberOfParallelSubtasks(1)
+                        .build();
+        return new SinkInitContext(createSinkWriterMetricGroup(), timeService, null) {
+            @Override
+            public TaskInfo getTaskInfo() {
+                return taskInfo;
+            }
+        };
     }
 
     private static Collection<FlinkKafkaInternalProducer<byte[], byte[]>> getProducers(
