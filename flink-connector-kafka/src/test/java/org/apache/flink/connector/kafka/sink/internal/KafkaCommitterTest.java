@@ -21,16 +21,20 @@ package org.apache.flink.connector.kafka.sink.internal;
 import org.apache.flink.api.connector.sink2.mocks.MockCommitRequest;
 import org.apache.flink.connector.kafka.sink.KafkaCommittable;
 import org.apache.flink.testutils.logging.LoggerAuditingExtension;
+import org.apache.flink.util.FlinkRuntimeException;
 
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.errors.InvalidTxnStateException;
 import org.apache.kafka.common.errors.ProducerFencedException;
+import org.apache.kafka.common.errors.UnknownProducerIdException;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.assertj.core.api.Condition;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
@@ -40,6 +44,7 @@ import java.util.Properties;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
+import java.util.stream.Stream;
 
 import static org.apache.flink.connector.kafka.testutils.KafkaUtil.checkProducerLeak;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -114,22 +119,89 @@ class KafkaCommitterTest {
         }
     }
 
-    @Test
-    public void testFailJobOnKnownFatalError() throws IOException, InterruptedException {
+    static Stream<RuntimeException> rejectedCommits() {
+        return Stream.of(
+                new ProducerFencedException("test"),
+                new InvalidTxnStateException("test"),
+                new UnknownProducerIdException("test"));
+    }
+
+    /**
+     * A committable with the producer of the writer is a transaction that this task has written in
+     * this attempt. If the broker rejects its commit, the records are missing from the output.
+     */
+    @ParameterizedTest
+    @MethodSource("rejectedCommits")
+    public void testFailJobOnRejectedCommitOfWriterTransaction(RuntimeException rejection)
+            throws IOException, InterruptedException {
         Properties properties = getProperties();
+        properties.put(ProducerConfig.TRANSACTION_TIMEOUT_CONFIG, "1234");
         try (final KafkaCommitter committer =
                         new KafkaCommitter(
                                 properties, TRANS_ID, SUB_ID, ATTEMPT, false, MOCK_FACTORY);
                 FlinkKafkaInternalProducer<?, ?> producer =
-                        new MockProducer(properties, new ProducerFencedException("test"));
+                        new MockProducer(properties, rejection);
                 ReadableBackchannel<TransactionFinished> backchannel =
                         BackchannelFactory.getInstance()
                                 .getReadableBackchannel(SUB_ID, ATTEMPT, TRANS_ID)) {
-            // will fail because transaction not started
-            final MockCommitRequest<KafkaCommittable> request =
-                    new MockCommitRequest<>(KafkaCommittable.of(producer));
+            final RecordingCommitRequest request =
+                    new RecordingCommitRequest(KafkaCommittable.of(producer));
             committer.commit(Collections.singletonList(request));
+
+            assertThat(request.getFailedWithUnknownReason())
+                    .as("the task fails")
+                    .isInstanceOf(FlinkRuntimeException.class)
+                    .hasMessageContaining("'" + TRANS_ID + "'")
+                    .hasMessageContaining(rejection.getClass().getSimpleName())
+                    .hasMessageContaining("can no longer commit the transaction")
+                    .hasMessageContaining("lost")
+                    .hasCause(rejection);
+            if (!(rejection instanceof UnknownProducerIdException)) {
+                assertThat(request.getFailedWithUnknownReason())
+                        .as("the message names both ways to lose a transaction")
+                        .hasMessageContaining("'transactional.id'")
+                        .hasMessageContaining("'transaction.timeout.ms' (1234ms)");
+            }
+            assertThat(request.failedWithKnownReason).isNull();
+            // do not recycle if a fail-over is triggered;
+            // else there may be a race-condition in creating a new transaction with the same name
+            assertThat(backchannel).doesNotHave(transactionFinished(false));
+        }
+    }
+
+    /**
+     * A committable without a producer was restored from state, or its writer is not chained to the
+     * committer. A rejected commit is expected in some cases then, and it is logged and dropped.
+     */
+    @ParameterizedTest
+    @MethodSource("rejectedCommits")
+    public void testDropRejectedCommitOfRestoredTransaction(RuntimeException rejection)
+            throws IOException, InterruptedException {
+        Properties properties = getProperties();
+        try (final KafkaCommitter committer =
+                        new KafkaCommitter(
+                                properties,
+                                TRANS_ID,
+                                SUB_ID,
+                                ATTEMPT,
+                                false,
+                                (props, transactionalId) -> new MockProducer(props, rejection));
+                ReadableBackchannel<TransactionFinished> backchannel =
+                        BackchannelFactory.getInstance()
+                                .getReadableBackchannel(SUB_ID, ATTEMPT, TRANS_ID)) {
+            final RecordingCommitRequest request =
+                    new RecordingCommitRequest(
+                            new KafkaCommittable(PRODUCER_ID, EPOCH, TRANS_ID, null));
+            committer.commit(Collections.singletonList(request));
+
+            assertThat(request.getFailedWithUnknownReason()).as("the task goes on").isNull();
+            assertThat(request.failedWithKnownReason).isSameAs(rejection);
+            assertThat(errorLogger.getMessages())
+                    .anyMatch(message -> message.contains("Unable to commit transaction"))
+                    .as("the task does not fail, so the log must not announce a restart")
+                    .noneMatch(message -> message.contains("restart"));
             assertThat(backchannel).has(transactionFinished(false));
+            assertThat(committer.getCommittingProducer()).isNull();
         }
     }
 
@@ -261,6 +333,20 @@ class KafkaCommitterTest {
         properties.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
         properties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
         return properties;
+    }
+
+    /** Also records the failures that do not fail the task. */
+    private static class RecordingCommitRequest extends MockCommitRequest<KafkaCommittable> {
+        private Throwable failedWithKnownReason;
+
+        private RecordingCommitRequest(KafkaCommittable committable) {
+            super(committable);
+        }
+
+        @Override
+        public void signalFailedWithKnownReason(Throwable t) {
+            failedWithKnownReason = t;
+        }
     }
 
     private static class MockProducer extends FlinkKafkaInternalProducer<byte[], byte[]> {

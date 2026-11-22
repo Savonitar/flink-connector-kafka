@@ -192,6 +192,43 @@ public class KafkaUtil {
         }
     }
 
+    /**
+     * Waits until no transaction is open on the topic, so that a consumer with isolation level
+     * {@code read_committed} can read up to the end of the topic.
+     *
+     * <p>A commit returns to the producer as soon as the transaction coordinator has stored the
+     * decision; the markers that end the transaction in the partitions are written after that.
+     * Until then, the records of the transaction are not visible to such a consumer.
+     *
+     * @param topic to wait for
+     * @param properties used to configure the created {@link KafkaConsumer}s
+     */
+    public static void waitUntilNoTransactionIsOpen(String topic, Properties properties)
+            throws Exception {
+        final Properties consumerConfig = new Properties();
+        consumerConfig.putAll(properties);
+        consumerConfig.put("key.deserializer", ByteArrayDeserializer.class.getName());
+        consumerConfig.put("value.deserializer", ByteArrayDeserializer.class.getName());
+        final Properties committedConsumerConfig = new Properties();
+        committedConsumerConfig.putAll(consumerConfig);
+        consumerConfig.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_uncommitted");
+        committedConsumerConfig.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
+        try (KafkaConsumer<byte[], byte[]> consumer = new KafkaConsumer<>(consumerConfig);
+                KafkaConsumer<byte[], byte[]> committedConsumer =
+                        new KafkaConsumer<>(committedConsumerConfig)) {
+            final Set<TopicPartition> topicPartitions = getAllPartitions(consumer, topic);
+            // the end offset of a read_committed consumer stops at the first open transaction
+            CommonTestUtils.waitUtil(
+                    () ->
+                            committedConsumer
+                                    .endOffsets(topicPartitions)
+                                    .equals(consumer.endOffsets(topicPartitions)),
+                    Duration.ofSeconds(REQUEST_TIMEOUT_SECONDS),
+                    Duration.ofMillis(50),
+                    "Transactions on topic " + topic + " did not finish");
+        }
+    }
+
     private static Set<TopicPartition> getAllPartitions(
             KafkaConsumer<byte[], byte[]> consumer, String topic) {
         return consumer.partitionsFor(topic).stream()

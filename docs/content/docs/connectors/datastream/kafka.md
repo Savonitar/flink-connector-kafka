@@ -790,6 +790,53 @@ in Kafka config:
 Default values for the above options can easily lead to data loss.
 Please refer to the Kafka documentation for more explanation.
 
+#### Aborted transactions with `DeliveryGuarantee.EXACTLY_ONCE`
+
+With `DeliveryGuarantee.EXACTLY_ONCE` the `KafkaSink` writes the records between two checkpoints in one
+Kafka transaction and commits that transaction after the checkpoint has completed. The records are lost
+if the broker aborts the transaction before this commit. The broker does so in two cases:
+
+- The transaction has been open for longer than `transaction.timeout.ms`, for example because a
+  checkpoint, several failed checkpoints in a row, or the restart of the job after a failure took that
+  long. A transaction is committed only when a checkpoint completes, so it stays open during the failed
+  checkpoints before that one.
+- Another producer has been initialized with the same `transactional.id`. The ids of the sink have the
+  form `transactionalIdPrefix-subtask-offset`. Another sink with the same `transactionalIdPrefix` on the
+  same Kafka cluster therefore uses the same ids, and so does another execution attempt of the same
+  subtask. Two attempts of a subtask can run at the same time for a while, for example when a TaskManager
+  has lost its connection to the JobManager and has not stopped its tasks yet.
+
+The commit of the aborted transaction fails with a `ProducerFencedException` or an
+`InvalidTxnStateException`. What the sink does then depends on the transaction:
+
+- The task has written the transaction itself since it was last started, and the writer and the committer of
+  the sink run in the same task: the task fails. The cause of the failure reads
+  `Unable to commit transaction '<transactional.id>' because the broker rejected the commit` and says
+  that the records are lost unless another producer has committed the transaction. After the restart
+  the sink tries the commit once more from the restored checkpoint. It is rejected again, but now it is
+  only logged, so the same transaction does not fail the task a second time.
+- The transaction has been restored from a checkpoint or savepoint, or the committer does not run in
+  the task of the writer: the sink logs a message that starts with `Unable to commit transaction`, and
+  the job goes on.
+
+In streaming execution the writer and the committer run in the same task unless operator chaining is
+disabled for them. In batch execution the committer always runs in a task of its own.
+
+In both cases the records of the aborted transaction are lost. Failing the task does not bring them
+back: the checkpoint that covers them is complete, so the restarted job continues after them and does
+not write them again. The failure only makes sure that the loss does not go unnoticed.
+
+Where the task fails for an aborted transaction, that is with the writer and the committer in one task,
+it fails again for every further transaction that is aborted like this. If the cause persists, that
+can be every checkpoint: checkpoints that regularly take longer than `transaction.timeout.ms`, or two
+jobs that share a `transactionalIdPrefix`. The job then restarts at every such checkpoint. It ends as
+`FAILED` once its restart strategy is used up, and at the first rejected commit if it has no restart
+strategy.
+
+A commit that is rejected with an `UnknownProducerIdException` follows the same rule: the task fails,
+or the error is logged and the job goes on. In that case the records may be lost; the error does not
+tell whether the broker has aborted the transaction.
+
 ### UnknownTopicOrPartitionException
 
 One possible cause of this error is when a new leader election is taking place,
@@ -805,5 +852,7 @@ The reason for this exception is most likely a transaction timeout on the broker
 [KAFKA-6119](https://issues.apache.org/jira/browse/KAFKA-6119), the `(producerId, epoch)` will be fenced off
 after a transaction timeout and all of its pending transactions are aborted (each `transactional.id` is
 mapped to a single `producerId`; this is described in more detail in the following [blog post](https://www.confluent.io/blog/simplified-robust-exactly-one-semantics-in-kafka-2-5/)).
+The exception is also raised after another producer has been initialized with the same `transactional.id`.
+See [Data loss](#data-loss) for what the `KafkaSink` does when the commit of a transaction fails with it.
 
 {{< top >}}

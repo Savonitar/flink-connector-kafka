@@ -43,6 +43,7 @@ import org.apache.flink.connector.kafka.sink.testutils.KafkaSinkExternalContextF
 import org.apache.flink.connector.kafka.testutils.DockerImageVersions;
 import org.apache.flink.connector.kafka.testutils.KafkaUtil;
 import org.apache.flink.connector.kafka.testutils.TestKafkaContainer;
+import org.apache.flink.connector.kafka.util.AdminUtils;
 import org.apache.flink.connector.testframe.environment.MiniClusterTestEnvironment;
 import org.apache.flink.connector.testframe.external.DefaultContainerizedExternalSystem;
 import org.apache.flink.connector.testframe.junit.annotations.TestContext;
@@ -52,6 +53,10 @@ import org.apache.flink.connector.testframe.junit.annotations.TestSemantics;
 import org.apache.flink.connector.testframe.testsuites.SinkTestSuiteBase;
 import org.apache.flink.core.memory.DataInputView;
 import org.apache.flink.core.memory.DataOutputView;
+import org.apache.flink.runtime.executiongraph.AccessExecution;
+import org.apache.flink.runtime.executiongraph.AccessExecutionGraph;
+import org.apache.flink.runtime.executiongraph.AccessExecutionVertex;
+import org.apache.flink.runtime.executiongraph.ErrorInfo;
 import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.runtime.minicluster.MiniCluster;
@@ -73,7 +78,11 @@ import org.apache.flink.testutils.junit.SharedReference;
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.DeleteTopicsResult;
+import org.apache.kafka.clients.admin.TransactionListing;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.assertj.core.api.InstanceOfAssertFactories;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -101,8 +110,10 @@ import javax.annotation.Nullable;
 
 import java.io.File;
 import java.nio.ByteBuffer;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -112,12 +123,15 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 
 import static org.apache.flink.configuration.StateRecoveryOptions.SAVEPOINT_PATH;
 import static org.apache.flink.connector.kafka.testutils.KafkaUtil.checkProducerLeak;
@@ -136,6 +150,7 @@ class KafkaSinkITCase {
     private static final short TOPIC_REPLICATION_FACTOR = 1;
     private static final long CHECKPOINT_PATH_LOOKUP_TIMEOUT_SECONDS = 10;
     private static final long CHECKPOINT_PATH_LOOKUP_POLL_INTERVAL_MILLIS = 200;
+    private static final long ABORTED_TRANSACTION_TEST_TIMEOUT_SECONDS = 120;
     private static AdminClient admin;
 
     private String topic;
@@ -293,6 +308,119 @@ class KafkaSinkITCase {
     public void testRecoveryWithExactlyOnceGuaranteeAndConcurrentCheckpoints(
             TransactionNamingStrategy namingStrategy, boolean chained) throws Exception {
         testRecoveryWithAssertion(DeliveryGuarantee.EXACTLY_ONCE, 2, namingStrategy, chained);
+    }
+
+    /**
+     * Tests what the job does when the broker aborts a transaction of the running attempt between
+     * its pre-commit and its commit, here because another producer takes over the transactional id:
+     * the task fails once, the commit that is tried again after the restart is dropped, and the job
+     * goes on. The records of the aborted transaction stay lost.
+     */
+    @ParameterizedTest
+    @EnumSource(TransactionNamingStrategy.class)
+    public void testFailOnceWhenPrecommittedTransactionIsAborted(
+            TransactionNamingStrategy namingStrategy,
+            @InjectMiniCluster MiniCluster miniCluster,
+            @InjectClusterClient ClusterClient<?> clusterClient)
+            throws Exception {
+        final int count = 30;
+        final Configuration config = createConfiguration(1);
+        // the job survives exactly one failure
+        config.set(RestartStrategyOptions.RESTART_STRATEGY, "fixed-delay");
+        config.set(RestartStrategyOptions.RESTART_STRATEGY_FIXED_DELAY_ATTEMPTS, 1);
+        config.set(
+                RestartStrategyOptions.RESTART_STRATEGY_FIXED_DELAY_DELAY, Duration.ofMillis(100));
+        final StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(config);
+        env.enableCheckpointing(100L);
+        final SharedReference<PrecommitGate.Controls> gate =
+                sharedObjects.add(new PrecommitGate.Controls());
+        // source, gate and sink are chained, see PrecommitGate
+        createSource(env, true, count)
+                .map(new PrecommitGate(gate))
+                .sinkTo(
+                        new KafkaSinkBuilder<Long>()
+                                .setBootstrapServers(KAFKA_CONTAINER.getBootstrapServers())
+                                .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+                                .setRecordSerializer(
+                                        KafkaRecordSerializationSchema.builder()
+                                                .setTopic(topic)
+                                                .setValueSerializationSchema(new RecordSerializer())
+                                                .build())
+                                .setTransactionalIdPrefix("kafka-sink-" + UUID.randomUUID())
+                                .setTransactionNamingStrategy(namingStrategy)
+                                .build());
+        final JobID jobId = clusterClient.submitJob(env.getStreamGraph().getJobGraph()).get();
+
+        try {
+            assertThat(
+                            gate.get()
+                                    .precommitted
+                                    .await(
+                                            ABORTED_TRANSACTION_TEST_TIMEOUT_SECONDS,
+                                            TimeUnit.SECONDS))
+                    .as("the sink pre-committed records for a checkpoint")
+                    .isTrue();
+            // the pre-committed transaction is the only one with records on this topic
+            final Collection<TransactionListing> openTransactions =
+                    AdminUtils.getOpenTransactionsForTopics(admin, Collections.singleton(topic));
+            assertThat(openTransactions).hasSize(1);
+            final String transactionalId = openTransactions.iterator().next().transactionalId();
+
+            final Properties producerProperties = getKafkaClientConfiguration();
+            producerProperties.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, transactionalId);
+            try (KafkaProducer<byte[], byte[]> otherProducer =
+                    new KafkaProducer<>(
+                            producerProperties,
+                            new ByteArraySerializer(),
+                            new ByteArraySerializer())) {
+                // aborts the open transaction of the sink
+                otherProducer.initTransactions();
+            }
+
+            gate.get().proceed.countDown();
+            final JobResult jobResult =
+                    clusterClient
+                            .requestJobResult(jobId)
+                            .get(ABORTED_TRANSACTION_TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            assertThat(jobResult.isSuccess())
+                    .as("the job goes on after one failure: %s", jobResult.getSerializedThrowable())
+                    .isTrue();
+
+            final AccessExecutionGraph executionGraph =
+                    miniCluster
+                            .getExecutionGraph(jobId)
+                            .get(ABORTED_TRANSACTION_TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            final List<String> failures =
+                    StreamSupport.stream(
+                                    executionGraph.getAllExecutionVertices().spliterator(), false)
+                            .map(AccessExecutionVertex::getExecutionHistory)
+                            .flatMap(history -> history.getHistoricalExecutions().stream())
+                            .map(AccessExecution::getFailureInfo)
+                            .flatMap(Optional::stream)
+                            .map(ErrorInfo::getExceptionAsString)
+                            .collect(Collectors.toList());
+            assertThat(failures)
+                    .as("the task fails for the lost transaction, and only once")
+                    .singleElement(InstanceOfAssertFactories.STRING)
+                    .contains("Unable to commit transaction '" + transactionalId + "'")
+                    .contains("ProducerFencedException")
+                    .contains("its records are lost");
+
+            final Set<Long> expectedRecords = new ConcurrentSkipListSet<>(gate.get().records);
+            assertThat(expectedRecords).as("records emitted by the source").hasSize(count);
+            assertThat(gate.get().precommittedRecords).isNotEmpty();
+            expectedRecords.removeAll(gate.get().precommittedRecords);
+            // the broker ends a transaction in the partition after it has answered the producer
+            KafkaUtil.waitUntilNoTransactionIsOpen(topic, getKafkaClientConfiguration());
+            assertThat(deserializeValues(drainAllRecordsFromTopic(topic, true)))
+                    .as(
+                            "the failure does not bring the records of the aborted transaction"
+                                    + " back; all other records are committed exactly once")
+                    .containsExactlyInAnyOrderElementsOf(expectedRecords);
+        } finally {
+            gate.get().proceed.countDown();
+        }
     }
 
     @ParameterizedTest(name = "{0}, chained={1}")
@@ -836,6 +964,50 @@ class KafkaSinkITCase {
         @Override
         public void initializeState(FunctionInitializationContext context) throws Exception {
             snapshottedRecords = context.getOperatorStateStore().getListState(STATE_DESCRIPTOR);
+        }
+    }
+
+    /**
+     * Stops the first checkpoint that covers records after the sink has pre-committed them and
+     * before the checkpoint can complete. It has to be chained to the sink writer: all operators of
+     * a chain prepare for the barrier, which is where the writer flushes and pre-commits, before
+     * the first of them takes its snapshot.
+     */
+    private static class PrecommitGate implements MapFunction<Long, Long>, CheckpointedFunction {
+        private final SharedReference<Controls> controls;
+        private final List<Long> recordsSinceLastCheckpoint = new ArrayList<>();
+
+        private PrecommitGate(SharedReference<Controls> controls) {
+            this.controls = controls;
+        }
+
+        @Override
+        public Long map(Long value) {
+            controls.get().records.add(value);
+            recordsSinceLastCheckpoint.add(value);
+            return value;
+        }
+
+        @Override
+        public void snapshotState(FunctionSnapshotContext context) throws Exception {
+            if (!recordsSinceLastCheckpoint.isEmpty()
+                    && controls.get().closed.compareAndSet(false, true)) {
+                controls.get().precommittedRecords.addAll(recordsSinceLastCheckpoint);
+                controls.get().precommitted.countDown();
+                controls.get().proceed.await();
+            }
+            recordsSinceLastCheckpoint.clear();
+        }
+
+        @Override
+        public void initializeState(FunctionInitializationContext context) {}
+
+        private static class Controls {
+            private final Set<Long> records = new ConcurrentSkipListSet<>();
+            private final List<Long> precommittedRecords = new CopyOnWriteArrayList<>();
+            private final AtomicBoolean closed = new AtomicBoolean();
+            private final CountDownLatch precommitted = new CountDownLatch(1);
+            private final CountDownLatch proceed = new CountDownLatch(1);
         }
     }
 

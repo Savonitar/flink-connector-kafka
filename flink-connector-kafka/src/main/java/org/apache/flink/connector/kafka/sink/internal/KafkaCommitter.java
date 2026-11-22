@@ -24,6 +24,7 @@ import org.apache.flink.api.connector.sink2.Committer;
 import org.apache.flink.connector.kafka.sink.KafkaCommittable;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.util.ExceptionUtils;
+import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.IOUtils;
 
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -106,27 +107,27 @@ public class KafkaCommitter implements Committer<KafkaCommittable>, Closeable {
                 LOG.warn(
                         "Encountered retriable exception while committing {}.", transactionalId, e);
                 request.retryLater();
-            } catch (ProducerFencedException e) {
-                logFencedRequest(request, e);
-                handleFailedTransaction(producer);
-                request.signalFailedWithKnownReason(e);
-            } catch (InvalidTxnStateException e) {
-                // This exception only occurs when aborting after a commit or vice versa.
-                // It does not appear on double commits or double aborts.
-                LOG.error(
-                        "Unable to commit transaction ({}) because it's in an invalid state. "
-                                + "Most likely the transaction has been aborted for some reason. Please check the Kafka logs for more details.",
-                        request,
-                        e);
-                handleFailedTransaction(producer);
-                request.signalFailedWithKnownReason(e);
-            } catch (UnknownProducerIdException e) {
-                LOG.error(
-                        "Unable to commit transaction ({}) " + UNKNOWN_PRODUCER_ID_ERROR_MESSAGE,
-                        request,
-                        e);
-                handleFailedTransaction(producer);
-                request.signalFailedWithKnownReason(e);
+            } catch (ProducerFencedException
+                    | InvalidTxnStateException
+                    | UnknownProducerIdException e) {
+                if (writerProducer.isPresent()) {
+                    // The writer of this task wrote the transaction in this attempt and handed
+                    // its producer over. The broker rejected the commit, and this producer can
+                    // no longer commit the transaction. Unless another producer has committed
+                    // it, its records are missing from the output. Fail the task instead of
+                    // going on silently.
+                    failOnRejectedCommit(request, e);
+                } else {
+                    // Without the producer of the writer, the committable was restored from
+                    // state or was written by a task that is not chained to this committer; the
+                    // two cannot be told apart. For a restored committable these errors are
+                    // expected in some cases and do not prove a loss (see logFencedRequest).
+                    // Failing the task would also repeat after every restart, because the
+                    // committable is part of the restored state. So log the error and go on.
+                    logRejectedCommit(request, e);
+                    handleFailedTransaction(producer);
+                    request.signalFailedWithKnownReason(e);
+                }
             } catch (InterruptException e) {
                 // note that we do not attempt to recover from this exception; producer is likely
                 // left in an inconsistent state
@@ -147,6 +148,71 @@ public class KafkaCommitter implements Committer<KafkaCommittable>, Closeable {
                 // cause failover
                 request.signalFailedWithUnknownReason(e);
             }
+        }
+    }
+
+    /**
+     * Fails the task for a transaction that this task has written in this attempt and that the
+     * broker refuses to commit.
+     *
+     * <p>The writer is not informed through the backchannel: the task fails over, and recycling the
+     * producer could race with the creation of a new transaction with the same name.
+     */
+    private void failOnRejectedCommit(CommitRequest<KafkaCommittable> request, Exception e) {
+        final String consequenceAndCause;
+        if (e instanceof UnknownProducerIdException) {
+            consequenceAndCause =
+                    "Its records may be lost. The broker does not know the producer of the"
+                            + " transaction, which points to a bug in the Kafka broker"
+                            + " (KAFKA-9310); please upgrade to Kafka 2.5+.";
+        } else {
+            final Object transactionTimeout =
+                    kafkaProducerConfig.get(ProducerConfig.TRANSACTION_TIMEOUT_CONFIG);
+            consequenceAndCause =
+                    String.format(
+                            "Unless another producer has committed it, its records are lost: a"
+                                    + " job that restarts from a checkpoint taken after the"
+                                    + " records were written does not write them again. The"
+                                    + " broker rejects the commit after another producer has"
+                                    + " been initialized with the same '%s', for example by a"
+                                    + " different sink with the same transactionalIdPrefix or"
+                                    + " by another attempt of this subtask that runs at the"
+                                    + " same time, or after the transaction was open for longer"
+                                    + " than '%s'%s.",
+                            ProducerConfig.TRANSACTIONAL_ID_CONFIG,
+                            ProducerConfig.TRANSACTION_TIMEOUT_CONFIG,
+                            transactionTimeout == null ? "" : " (" + transactionTimeout + "ms)");
+        }
+        final String message =
+                String.format(
+                        "Unable to commit transaction '%s' because the broker rejected the"
+                                + " commit with %s. This producer can no longer commit the"
+                                + " transaction. %s",
+                        request.getCommittable().getTransactionalId(),
+                        e.getClass().getSimpleName(),
+                        consequenceAndCause);
+        LOG.error(message, e);
+        request.signalFailedWithUnknownReason(new FlinkRuntimeException(message, e));
+    }
+
+    private void logRejectedCommit(CommitRequest<KafkaCommittable> request, Exception e) {
+        if (e instanceof ProducerFencedException) {
+            logFencedRequest(request, (ProducerFencedException) e);
+        } else if (e instanceof InvalidTxnStateException) {
+            // This exception only occurs when aborting after a commit or vice versa.
+            // It does not appear on double commits or double aborts.
+            LOG.error(
+                    "Unable to commit transaction ({}) because it's in an invalid state. "
+                            + "Most likely the transaction has been aborted for some reason. Please check the Kafka logs for more details.",
+                    request,
+                    e);
+        } else {
+            LOG.error(
+                    "Unable to commit transaction ({}) because the broker does not know its producer. "
+                            + "This points to a bug in the Kafka broker (KAFKA-9310). Please upgrade to Kafka 2.5+. If you are running with concurrent checkpoints, you also may want to try without them. "
+                            + "The transaction stays uncommitted and its records may be lost.",
+                    request,
+                    e);
         }
     }
 

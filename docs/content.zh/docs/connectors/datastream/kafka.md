@@ -676,6 +676,37 @@ Flink 通过 Kafka 连接器提供了一流的支持，可以对 Kerberos 配置
 
 上述选项的默认值是很容易导致数据丢失的。请参考 Kafka 文档以获得更多的解释。
 
+#### 使用 `DeliveryGuarantee.EXACTLY_ONCE` 时事务被中止
+
+使用 `DeliveryGuarantee.EXACTLY_ONCE` 时，`KafkaSink` 会把两次 checkpoint 之间的数据写入同一个 Kafka 事务，并在该 checkpoint 完成之后提交这个事务。
+如果 broker 在提交之前中止了这个事务，其中的数据就会丢失。broker 在以下两种情况下会中止事务：
+
+- 事务处于打开状态的时间超过了 `transaction.timeout.ms`，例如某次 checkpoint、连续多次失败的 checkpoint 或者作业失败后的重启耗时过长。
+  事务只有在 checkpoint 完成时才会被提交，因此在此之前的 checkpoint 失败期间它一直处于打开状态。
+- 另一个 producer 使用相同的 `transactional.id` 进行了初始化。sink 的事务 ID 格式为 `transactionalIdPrefix-subtask-offset`，
+  因此在同一个 Kafka 集群上使用相同 `transactionalIdPrefix` 的另一个 sink 会使用相同的 ID，同一个 subtask 的另一次执行尝试（execution attempt）也是如此。
+  同一个 subtask 的两次执行尝试有可能在一段时间内同时运行，例如 TaskManager 与 JobManager 失去连接、但尚未停止其上的 task 时。
+
+此时提交被中止的事务会以 `ProducerFencedException` 或 `InvalidTxnStateException` 失败。sink 接下来的行为取决于这个事务：
+
+- 事务是该 task 自本次启动以来自己写入的，并且 sink 的 writer 和 committer 运行在同一个 task 中：task 会失败。
+  失败原因为 `Unable to commit transaction '<transactional.id>' because the broker rejected the commit`，并说明除非有其他 producer 已经提交了该事务，否则数据已经丢失。
+  重启之后，sink 会根据恢复的 checkpoint 再尝试提交一次。这次提交同样会被拒绝，但此时只会记录日志，因此同一个事务不会让 task 再次失败。
+- 事务是从 checkpoint 或 savepoint 中恢复的，或者 committer 没有运行在 writer 所在的 task 中：sink 会记录一条以
+  `Unable to commit transaction` 开头的日志，作业继续运行。
+
+在流模式下，除非对 writer 和 committer 禁用了 operator chaining，否则二者运行在同一个 task 中。在批模式下，committer 总是运行在单独的 task 中。
+
+在这两种情况下，被中止事务中的数据都已经丢失。让 task 失败并不能找回这些数据：包含这些数据的 checkpoint 已经完成，
+重启后的作业会从这些数据之后继续处理，不会再次写入它们。task 失败只是为了保证数据丢失不会被忽略。
+
+在 task 会因事务被中止而失败的情况下（即 writer 和 committer 运行在同一个 task 中），此后每当又有事务以这种方式被中止，task 都会再次失败。如果原因一直存在，每次 checkpoint 都可能如此：
+例如 checkpoint 的耗时经常超过 `transaction.timeout.ms`，或者两个作业使用了相同的 `transactionalIdPrefix`。
+这时作业会在每个这样的 checkpoint 处重启。重启策略用尽之后作业以 `FAILED` 状态结束；如果没有配置重启策略，则在第一次提交被拒绝时就以 `FAILED` 结束。
+
+提交被 `UnknownProducerIdException` 拒绝时遵循同样的规则：task 失败，或者只记录日志、作业继续运行。
+这种情况下数据可能丢失；该错误并不能说明 broker 是否已经中止了事务。
+
 <a name="unknowntopicorpartitionexception"></a>
 
 ### UnknownTopicOrPartitionException
@@ -687,5 +718,7 @@ Flink 通过 Kafka 连接器提供了一流的支持，可以对 Kerberos 配置
 
 这个错误是由于 `FlinkKafkaProducer` 所生成的 `transactional.id` 与其他应用所使用的的产生了冲突。多数情况下，由于 `FlinkKafkaProducer` 产生的 ID 都是以 `taskName + "-" + operatorUid` 为前缀的，这些产生冲突的应用也是使用了相同 Job Graph 的 Flink Job。
 我们可以使用 `setTransactionalIdPrefix()` 方法来覆盖默认的行为，为每个不同的 Job 分配不同的 `transactional.id` 前缀来解决这个问题。
+
+当提交事务因为这个异常而失败时 `KafkaSink` 的行为，请参见[数据丢失](#data-loss)。
 
 {{< top >}}
