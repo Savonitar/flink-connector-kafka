@@ -70,12 +70,23 @@ public class KafkaCommitter implements Committer<KafkaCommittable>, Closeable {
             int attemptNumber,
             boolean reusesTransactionalIds,
             BiFunction<Properties, String, FlinkKafkaInternalProducer<?, ?>> producerFactory) {
+        this(
+                kafkaProducerConfig,
+                reusesTransactionalIds,
+                producerFactory,
+                BackchannelFactory.getInstance()
+                        .getWritableBackchannel(subtaskId, attemptNumber, transactionalIdPrefix));
+    }
+
+    KafkaCommitter(
+            Properties kafkaProducerConfig,
+            boolean reusesTransactionalIds,
+            BiFunction<Properties, String, FlinkKafkaInternalProducer<?, ?>> producerFactory,
+            WritableBackchannel<TransactionFinished> backchannel) {
         this.kafkaProducerConfig = kafkaProducerConfig;
         this.reusesTransactionalIds = reusesTransactionalIds;
         this.producerFactory = producerFactory;
-        backchannel =
-                BackchannelFactory.getInstance()
-                        .getWritableBackchannel(subtaskId, attemptNumber, transactionalIdPrefix);
+        this.backchannel = backchannel;
     }
 
     @VisibleForTesting

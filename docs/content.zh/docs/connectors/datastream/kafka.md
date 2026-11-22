@@ -583,6 +583,23 @@ KafkaRecordSerializationSchema.builder() \
   完成时才会可见，因此请按需调整 checkpoint 的间隔。请确认事务 ID 的前缀（transactionIdPrefix）对不同的应用是唯一的，以保证不同作业的事务
   不会互相影响！此外，强烈建议将 Kafka 的事务超时时间调整至远大于 checkpoint 最大间隔 + 最大重启时间，否则 Kafka 对未提交事务的过期处理会导致数据丢失。
 
+使用 ```DeliveryGuarantee.EXACTLY_ONCE``` 的 sink 所写入的快照（checkpoint 或 savepoint）中包含最后一个 checkpoint 间隔内的数据所在的事务。
+这些事务可能仍未提交，例如在触发了不停止作业的 savepoint 之后。从这样的快照恢复作业时：
+
+- 无论 sink 现在使用哪种语义保证，它都会在恢复过程中提交这些事务。因此，只要这些提交成功，更换语义保证就不会丢失快照所涵盖的数据。
+- 恢复过程需要 Kafka 集群的事务协调器（transaction coordinator）以及使用快照中事务 ID 的权限，即使 sink 已不再通过事务写入数据。
+  如果无法连接事务协调器，提交会被重试；当 committer 的重试次数（`sink.committer.retries`）用尽后，task 会失败。
+  如果 broker 拒绝提交一个此前尚未提交的事务，例如事务在此期间已经超时、broker 已不再记录该事务 ID，或者缺少使用该事务 ID 的权限，
+  使用 ```DeliveryGuarantee.AT_LEAST_ONCE``` 或 ```DeliveryGuarantee.NONE``` 的 sink 会将这次失败记录到日志中，作业继续运行，而该事务中的数据会丢失。
+  使用 ```DeliveryGuarantee.EXACTLY_ONCE``` 的 sink 在无法识别拒绝原因时则会使作业失败。
+- 如果一个作业仍在运行，那么从它的 savepoint 启动的第二个作业不能恢复该 sink 的状态，否则它会提交 savepoint 中属于仍在运行的作业的事务。
+  请为第二个作业的 sink 设置新的 `uid`，并允许跳过无法恢复的状态（`--allowNonRestoredState`）。第二个作业使用
+  ```DeliveryGuarantee.EXACTLY_ONCE``` 时同样如此。
+- 对于 exactly-once sink 已经开启、但不属于快照的事务，使用 ```DeliveryGuarantee.AT_LEAST_ONCE``` 或 ```DeliveryGuarantee.NONE``` 的 sink
+  不会结束它们。作业发生故障后可能会遗留这样的事务；在 checkpoint 进行期间取消作业后也会遗留，因为 sink 在被取消时不会中止已经为某个
+  checkpoint 预提交的事务。broker 会在它们的 `transaction.timeout.ms` 到期后中止这些事务。在此之前，`isolation.level` 设置为
+  `read_committed` 的 consumer 无法读取到同一分区中位于这些事务之后的数据。
+
 ### 监控
 
 Kafka sink 会在不同的[范围（Scope）]({{< ref "docs/ops/metrics" >}}/#scope)中汇报下列指标。

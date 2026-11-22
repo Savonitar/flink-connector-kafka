@@ -43,6 +43,7 @@ import org.apache.flink.connector.kafka.testutils.KafkaUtil;
 import org.apache.flink.connector.kafka.testutils.TestKafkaContainer;
 import org.apache.flink.connector.kafka.util.AdminUtils;
 import org.apache.flink.core.execution.JobClient;
+import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.core.memory.DataInputView;
 import org.apache.flink.core.memory.DataOutputView;
 import org.apache.flink.runtime.minicluster.MiniCluster;
@@ -67,6 +68,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
@@ -94,20 +97,7 @@ import java.util.stream.Collectors;
 import static org.apache.flink.configuration.StateRecoveryOptions.SAVEPOINT_PATH;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/**
- * Exercises transactional id reuse across checkpoint recovery with a real sink pipeline.
- *
- * <p>C1 completes and commits its transaction. C2's asynchronous snapshot is blocked rather than
- * failed so processing can continue through C3, which precommits a transaction reusing C1's
- * transactional id, while C1 remains the latest completed checkpoint. The job is then cancelled and
- * restored from C1 with the same transactional id prefix and operator identities.
- *
- * <p>This exercises the recovery fencing scenario handled by {@link KafkaCommitter#commit}. The
- * restored job must replay the uncheckpointed records and successfully commit new transactions
- * without losing or duplicating records. The first checkpoint after restoration must make the
- * replayed record visible to {@code read_committed} consumers; an abandoned transaction under the
- * reused transactional id must not block that output.
- */
+/** Exercises the recovery of {@link KafkaSink} transactions with a real sink pipeline. */
 @Testcontainers
 class KafkaSinkRecoveryITCase {
     private static final long TIMEOUT_SECONDS = 60;
@@ -134,6 +124,20 @@ class KafkaSinkRecoveryITCase {
         IOUtils.closeAll(cleanupActions, Throwable.class);
     }
 
+    /**
+     * Exercises transactional id reuse across checkpoint recovery.
+     *
+     * <p>C1 completes and commits its transaction. C2's asynchronous snapshot is blocked rather
+     * than failed so processing can continue through C3, which precommits a transaction reusing
+     * C1's transactional id, while C1 remains the latest completed checkpoint. The job is then
+     * cancelled and restored from C1 with the same transactional id prefix and operator identities.
+     *
+     * <p>This exercises the recovery fencing scenario handled by {@link KafkaCommitter#commit}. The
+     * restored job must replay the uncheckpointed records and successfully commit new transactions
+     * without losing or duplicating records. The first checkpoint after restoration must make the
+     * replayed record visible to {@code read_committed} consumers; an abandoned transaction under
+     * the reused transactional id must not block that output.
+     */
     @Test
     void recoversPooledTransactionsWithoutLosingNewRecords(
             @TempDir Path checkpointDirectory, @InjectMiniCluster MiniCluster miniCluster)
@@ -156,7 +160,13 @@ class KafkaSinkRecoveryITCase {
         final SharedReference<PipelineControls> recoveredControls =
                 sharedObjects.add(PipelineControls.withoutSnapshotBlocking());
         final JobClient original =
-                startJob(topic, transactionalIdPrefix, checkpointDirectory, originalControls, null);
+                startJob(
+                        topic,
+                        transactionalIdPrefix,
+                        DeliveryGuarantee.EXACTLY_ONCE,
+                        checkpointDirectory,
+                        originalControls,
+                        null);
         emit(originalControls, 0L);
         final String checkpointOnePath =
                 miniCluster
@@ -207,6 +217,7 @@ class KafkaSinkRecoveryITCase {
                 startJob(
                         topic,
                         transactionalIdPrefix,
+                        DeliveryGuarantee.EXACTLY_ONCE,
                         checkpointDirectory,
                         recoveredControls,
                         checkpointOnePath);
@@ -227,9 +238,84 @@ class KafkaSinkRecoveryITCase {
         assertThat(records).containsExactly(0L, 1L, 2L, 3L);
     }
 
+    /**
+     * A savepoint that does not stop the job is not followed by a notification of its completion,
+     * so the transaction with the records before the savepoint is still open when the job is
+     * cancelled afterwards. The savepoint covers these records: a job that is restored from it has
+     * to commit the transaction even if its sink no longer writes in transactions and no longer has
+     * a transactional id prefix.
+     */
+    @ParameterizedTest
+    @EnumSource(
+            value = DeliveryGuarantee.class,
+            names = {"AT_LEAST_ONCE", "NONE"})
+    void commitsTransactionOfSavepointAfterSwitchingFromExactlyOnce(
+            DeliveryGuarantee restoredGuarantee,
+            @TempDir Path checkpointDirectory,
+            @InjectMiniCluster MiniCluster miniCluster)
+            throws Exception {
+        final String topic = "guarantee-change-" + UUID.randomUUID();
+        final String transactionalIdPrefix = "guarantee-change-" + UUID.randomUUID();
+        final Properties kafkaProperties = kafkaProperties();
+        KafkaUtil.createNewTopicAndWaitForPartitionAssignment(topic, 1, 1, kafkaProperties);
+        cleanupActions.add(
+                () -> {
+                    try (AdminClient admin = AdminClient.create(kafkaProperties)) {
+                        admin.deleteTopics(Collections.singleton(topic))
+                                .all()
+                                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    }
+                });
+
+        final SharedReference<PipelineControls> originalControls =
+                sharedObjects.add(PipelineControls.withoutSnapshotBlocking());
+        final SharedReference<PipelineControls> recoveredControls =
+                sharedObjects.add(PipelineControls.withoutSnapshotBlocking());
+        final JobClient original =
+                startJob(
+                        topic,
+                        transactionalIdPrefix,
+                        DeliveryGuarantee.EXACTLY_ONCE,
+                        checkpointDirectory,
+                        originalControls,
+                        null);
+        emit(originalControls, 0L);
+        final String savepointPath =
+                miniCluster
+                        .triggerSavepoint(
+                                original.getJobID(),
+                                checkpointDirectory.toUri().toString(),
+                                false,
+                                SavepointFormatType.CANONICAL)
+                        .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        cancelAndWait(original, originalControls.get());
+
+        try (AdminClient admin = AdminClient.create(kafkaProperties)) {
+            assertThat(AdminUtils.getOpenTransactionsForTopics(admin, Collections.singleton(topic)))
+                    .as("the transaction of the savepoint is open before recovery")
+                    .hasSize(1);
+        }
+
+        final JobClient recovered =
+                startJob(
+                        topic,
+                        null,
+                        restoredGuarantee,
+                        checkpointDirectory,
+                        recoveredControls,
+                        savepointPath);
+        awaitCommittedRecords(topic, List.of(0L));
+
+        emit(recoveredControls, 1L);
+        miniCluster.triggerCheckpoint(recovered.getJobID()).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        awaitCommittedRecords(topic, List.of(0L, 1L));
+        cancelAndWait(recovered, recoveredControls.get());
+    }
+
     private JobClient startJob(
             String topic,
-            String transactionalIdPrefix,
+            @Nullable String transactionalIdPrefix,
+            DeliveryGuarantee deliveryGuarantee,
             Path checkpointDirectory,
             SharedReference<PipelineControls> controls,
             @Nullable String restorePath)
@@ -260,23 +346,25 @@ class KafkaSinkRecoveryITCase {
                         Long.MAX_VALUE,
                         parallelism -> new PermitRateLimiter(controls),
                         BasicTypeInfo.LONG_TYPE_INFO);
+        final KafkaSinkBuilder<Long> sink =
+                KafkaSink.<Long>builder()
+                        .setBootstrapServers(KAFKA.getBootstrapServers())
+                        .setDeliveryGuarantee(deliveryGuarantee)
+                        .setRecordSerializer(
+                                KafkaRecordSerializationSchema.builder()
+                                        .setTopic(topic)
+                                        .setValueSerializationSchema(new RecordSerializer())
+                                        .build());
+        if (transactionalIdPrefix != null) {
+            sink.setTransactionalIdPrefix(transactionalIdPrefix)
+                    .setTransactionNamingStrategy(TransactionNamingStrategy.POOLING);
+        }
         environment
                 .fromSource(source, WatermarkStrategy.noWatermarks(), "controlled source")
                 .uid("source")
                 .map(new CheckpointGate(controls))
                 .uid("checkpoint-gate")
-                .sinkTo(
-                        KafkaSink.<Long>builder()
-                                .setBootstrapServers(KAFKA.getBootstrapServers())
-                                .setTransactionalIdPrefix(transactionalIdPrefix)
-                                .setTransactionNamingStrategy(TransactionNamingStrategy.POOLING)
-                                .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
-                                .setRecordSerializer(
-                                        KafkaRecordSerializationSchema.builder()
-                                                .setTopic(topic)
-                                                .setValueSerializationSchema(new RecordSerializer())
-                                                .build())
-                                .build())
+                .sinkTo(sink.build())
                 .uid("kafka-sink");
         final JobClient job = environment.executeAsync("pooled transaction recovery");
         cleanupActions.add(0, () -> cancelAndWait(job, controls.get()));

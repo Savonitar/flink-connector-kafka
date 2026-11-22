@@ -677,6 +677,37 @@ an explanation of the different guarantees.
   transaction.timeout.ms)>> maximum checkpoint duration + maximum restart duration or data loss may
   happen when Kafka expires an uncommitted transaction. 
 
+A snapshot that a sink with ```DeliveryGuarantee.EXACTLY_ONCE``` wrote contains the transactions
+with the records of the last checkpoint interval. They can still be open, for example after a
+savepoint that did not stop the job. When a job is restored from such a snapshot:
+
+- The sink commits these transactions during the restore, whatever its delivery guarantee is now.
+  The records that the snapshot covers are therefore kept when the delivery guarantee is changed,
+  as long as these commits succeed.
+- The restore needs the transaction coordinator of the Kafka cluster and the permission to use the
+  transactional ids of the snapshot, also if the sink no longer writes in transactions. If the
+  coordinator cannot be reached, the commit is retried, and the task fails when the retries of the
+  committer (`sink.committer.retries`) are used up. If the broker rejects the commit of a
+  transaction that had not been committed yet, for example because the transaction has timed out
+  in the meantime, because the broker no longer knows the transactional id, or because the
+  permission to use the transactional id is missing, a sink with
+  ```DeliveryGuarantee.AT_LEAST_ONCE``` or ```DeliveryGuarantee.NONE``` logs the failure, the job
+  continues, and the records of that transaction are lost. A sink with
+  ```DeliveryGuarantee.EXACTLY_ONCE``` fails the job instead when it does not know the reason of
+  the rejection.
+- A second job that is started from a savepoint of a job that is still running must not restore
+  the state of this sink, because it would commit the transactions of the running job that the
+  savepoint contains. Give the sink of the second job a new `uid` and allow non-restored state
+  (`--allowNonRestoredState`). This also applies if the second job uses
+  ```DeliveryGuarantee.EXACTLY_ONCE```.
+- A sink with ```DeliveryGuarantee.AT_LEAST_ONCE``` or ```DeliveryGuarantee.NONE``` does not end
+  the transactions that the exactly-once sink had open and that are not part of the snapshot. Such
+  transactions can remain after a failure, and also after a cancel while a checkpoint was in
+  progress, because a sink that is cancelled does not abort a transaction that it has already
+  prepared for a checkpoint. The broker aborts them when their `transaction.timeout.ms` has
+  passed. Until then, consumers with `isolation.level` set to `read_committed` do not receive the
+  records that follow them in the same partition.
+
 ### Monitoring
 
 Kafka sink exposes the following metrics in the respective [scope]({{< ref "docs/ops/metrics" >}}/#scope).

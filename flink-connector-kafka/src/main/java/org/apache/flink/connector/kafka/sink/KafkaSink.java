@@ -32,7 +32,7 @@ import org.apache.flink.connector.kafka.lineage.TypeDatasetFacet;
 import org.apache.flink.connector.kafka.lineage.TypeDatasetFacetProvider;
 import org.apache.flink.connector.kafka.sink.internal.FlinkKafkaInternalProducer;
 import org.apache.flink.connector.kafka.sink.internal.KafkaCommitter;
-import org.apache.flink.connector.kafka.sink.internal.NoopCommitter;
+import org.apache.flink.connector.kafka.sink.internal.RestoredTransactionCommitter;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.flink.streaming.api.connector.sink2.CommittableMessage;
 import org.apache.flink.streaming.api.connector.sink2.CommittableMessageTypeInfo;
@@ -121,7 +121,10 @@ public class KafkaSink<IN>
                     transactionNamingStrategy == TransactionNamingStrategy.POOLING,
                     FlinkKafkaInternalProducer::new);
         }
-        return new NoopCommitter();
+        return new RestoredTransactionCommitter(
+                kafkaProducerConfig,
+                transactionNamingStrategy == TransactionNamingStrategy.POOLING,
+                FlinkKafkaInternalProducer::new);
     }
 
     @Internal
