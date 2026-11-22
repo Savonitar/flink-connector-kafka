@@ -17,6 +17,7 @@
 
 package org.apache.flink.connector.kafka.sink;
 
+import org.apache.flink.api.common.TaskInfo;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.base.DeliveryGuarantee;
@@ -27,6 +28,7 @@ import org.apache.flink.connector.kafka.sink.internal.TransactionFinished;
 import org.apache.flink.connector.kafka.sink.internal.TransactionOwnership;
 import org.apache.flink.connector.kafka.sink.internal.WritableBackchannel;
 import org.apache.flink.connector.kafka.util.AdminUtils;
+import org.apache.flink.connector.testutils.source.TestingTaskInfo;
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.groups.SinkWriterMetricGroup;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
@@ -55,6 +57,7 @@ import java.util.function.Consumer;
 
 import static org.apache.flink.connector.kafka.sink.internal.TransactionalIdFactory.buildTransactionalId;
 import static org.apache.flink.connector.kafka.testutils.KafkaUtil.drainAllRecordsFromTopic;
+import static org.apache.flink.connector.kafka.testutils.KafkaUtil.getOpenTransactionalIds;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.AssertionsForClassTypes.assertThatCode;
@@ -73,6 +76,18 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
 
     private static final Consumer<KafkaSinkBuilder<?>> EXACTLY_ONCE =
             sink -> sink.setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE);
+
+    /** Flink's default max parallelism for the parallelisms that the tests use. */
+    private static final int MAX_PARALLELISM = 128;
+
+    /** Marks an assertion that is expected to fail, so that a red build is not taken for new. */
+    private static final String KNOWN_DEFECT =
+            "KNOWN, OPEN DEFECT - this failure is expected until it is fixed: with INCREMENTING, "
+                    + "a writer does not find a transaction behind a gap in the subtask numbers "
+                    + "of an earlier attempt. ";
+
+    private static final String OPEN_TRANSACTIONS_AFTER_SCALE_IN =
+            "Open transactions after all writers of the new attempt have started";
 
     @Test
     void testFlushAsyncErrorPropagationAndErrorCounter() throws Exception {
@@ -279,6 +294,81 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
         }
     }
 
+    /**
+     * Tests that the writers of an attempt with fewer subtasks abort the transaction of a writer of
+     * the earlier attempt that was never closed, which is what the loss of a task manager leaves
+     * behind.
+     *
+     * <p>All other writers of the earlier attempt had started.
+     */
+    @Test
+    void shouldAbortTransactionOfLostSubtaskAfterScaleIn() throws Exception {
+        assertThat(getOpenTransactionalIdsAfterScaleIn(0, 2))
+                .as(OPEN_TRANSACTIONS_AFTER_SCALE_IN)
+                .isEmpty();
+    }
+
+    /**
+     * Tests the same as {@link #shouldAbortTransactionOfLostSubtaskAfterScaleIn()} for an earlier
+     * attempt that ended while only some of its writers had started. The subtask numbers that the
+     * earlier attempt had used then have a gap in front of the lost subtask 4: either subtask 2 is
+     * missing, or subtask 0, which is the number of the subtask that has to abort the transaction.
+     *
+     * <p>This test fails until the cleanup of {@link TransactionNamingStrategy#INCREMENTING} also
+     * finds a transaction behind such a gap.
+     */
+    @ParameterizedTest(name = "only subtasks {0} and 4 of the earlier attempt had started")
+    @ValueSource(ints = {0, 2})
+    void shouldAbortTransactionOfLostSubtaskBehindGapAfterScaleIn(int startedSubtask)
+            throws Exception {
+        assertThat(getOpenTransactionalIdsAfterScaleIn(startedSubtask))
+                .as(KNOWN_DEFECT + OPEN_TRANSACTIONS_AFTER_SCALE_IN)
+                .isEmpty();
+    }
+
+    /**
+     * An attempt with 6 subtasks ends before its first checkpoint. Subtask 4 has written a record
+     * and is not closed. The next attempt has 2 subtasks, of which subtask 0 is responsible for the
+     * transactions of the earlier subtasks 0, 2 and 4.
+     *
+     * @param closedSubtasks the other subtasks of the earlier attempt that had started; their
+     *     writers are closed as on a cancellation
+     * @return the transactional ids of the transactions that are open once both writers of the new
+     *     attempt have started
+     */
+    private List<String> getOpenTransactionalIdsAfterScaleIn(int... closedSubtasks)
+            throws Exception {
+        // the topic is named after the test, which makes the prefix unique; transactional ids
+        // that other tests have used would hide a gap
+        final String transactionalIdPrefix = topic;
+        final Consumer<KafkaSinkBuilder<?>> sink =
+                builder ->
+                        builder.setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+                                .setTransactionNamingStrategy(
+                                        TransactionNamingStrategy.INCREMENTING)
+                                .setTransactionalIdPrefix(transactionalIdPrefix);
+
+        try (final AdminClient admin = AdminClient.create(getKafkaClientConfiguration());
+                final ExactlyOnceKafkaWriter<Integer> lostWriter =
+                        createWriter(sink, createInitContext(4, 6, 0))) {
+            lostWriter.write(1, SINK_WRITER_CONTEXT);
+            lostWriter.flush(false);
+            assertThat(getOpenTransactionalIds(admin, topic))
+                    .containsExactly(buildTransactionalId(transactionalIdPrefix, 4, 1));
+
+            for (int subtaskId : closedSubtasks) {
+                createWriter(sink, createInitContext(subtaskId, 6, 0)).close();
+            }
+
+            try (final ExactlyOnceKafkaWriter<Integer> firstWriter =
+                            createWriter(sink, createInitContext(0, 2, 1));
+                    final ExactlyOnceKafkaWriter<Integer> secondWriter =
+                            createWriter(sink, createInitContext(1, 2, 1))) {
+                return getOpenTransactionalIds(admin, topic);
+            }
+        }
+    }
+
     /** Test that producers are reused when committed. */
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
@@ -474,6 +564,23 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
                         builder.setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
                                 .setTransactionNamingStrategy(namingStrategy),
                 createInitContext());
+    }
+
+    private SinkInitContext createInitContext(int subtaskId, int parallelism, int attemptNumber) {
+        final TaskInfo taskInfo =
+                new TestingTaskInfo.Builder()
+                        .setTaskName("TestTask")
+                        .setIndexOfThisSubtask(subtaskId)
+                        .setNumberOfParallelSubtasks(parallelism)
+                        .setMaxNumberOfParallelSubtasks(MAX_PARALLELISM)
+                        .setAttemptNumber(attemptNumber)
+                        .build();
+        return new SinkInitContext(createSinkWriterMetricGroup(), timeService, null) {
+            @Override
+            public TaskInfo getTaskInfo() {
+                return taskInfo;
+            }
+        };
     }
 
     private static Collection<FlinkKafkaInternalProducer<byte[], byte[]>> getProducers(

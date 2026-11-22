@@ -18,11 +18,14 @@
 
 package org.apache.flink.connector.kafka.testutils;
 
+import org.apache.flink.connector.kafka.util.AdminUtils;
 import org.apache.flink.core.testutils.CommonTestUtils;
 
+import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.admin.TransactionListing;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
@@ -200,6 +203,16 @@ public class KafkaUtil {
     }
 
     private static final Set<Long> KNOWN_LEAKS = new ConcurrentSkipListSet<>();
+
+    /**
+     * Returns the transactional ids of the open transactions that {@link
+     * AdminUtils#getOpenTransactionsForTopics} reports for the given topic.
+     */
+    public static List<String> getOpenTransactionalIds(Admin admin, String topic) {
+        return AdminUtils.getOpenTransactionsForTopics(admin, Collections.singleton(topic)).stream()
+                .map(TransactionListing::transactionalId)
+                .collect(Collectors.toList());
+    }
 
     public static void checkProducerLeak() {
         List<Map.Entry<Thread, StackTraceElement[]>> leaks = null;
