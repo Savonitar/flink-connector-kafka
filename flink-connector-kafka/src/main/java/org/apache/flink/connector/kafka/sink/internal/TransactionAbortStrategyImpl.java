@@ -42,6 +42,27 @@ public enum TransactionAbortStrategyImpl {
      * policy that prevents tight restart loops (e.g. incremental backoff or hard failure after X
      * attempts).
      *
+     * <p>The guess does not cover every rescaling. A subtask goes through the subtask numbers it is
+     * responsible for, starting with its own and adding the current parallelism at each step, and
+     * ends at the first number for which it finds no used transactional id. If a number on its way
+     * was never used since the restored checkpoint, the transactions of the higher numbers are not
+     * found. An example: an earlier attempt ended before its first checkpoint while some of its
+     * subtasks had not created their writer yet, a writer with a higher subtask number was not
+     * closed because its task manager was lost, and the current attempt runs with fewer subtasks.
+     *
+     * <p>A missed transaction remains unfinished until a later attempt comes across it or, at the
+     * latest, until the broker aborts it once its transaction timeout has elapsed. During that time
+     * the last stable offset of the partitions it wrote to does not advance, so {@code
+     * read_committed} consumers receive nothing from behind it. The output of the job stays
+     * complete, because the transaction only holds records from after the last completed
+     * checkpoint, which the restarted job writes again. What these consumers get to read is not
+     * protected in the same way: Kafka applies the retention of a topic to all log segments below
+     * the high watermark, and an unfinished transaction does not keep the segments that follow it.
+     * If the time or size limit of the topic's retention ({@code retention.ms}, {@code
+     * retention.bytes}) is reached while the transaction is unfinished, records that were committed
+     * after its first record can be deleted before these consumers were allowed to read them.
+     * {@link #LISTING} finds such a transaction.
+     *
      * <p>This is exactly the same behavior as in flink-connector-kafka 3.X.
      */
     PROBING {
@@ -61,6 +82,9 @@ public enum TransactionAbortStrategyImpl {
          * <p>When Flink downscales X subtasks to Y subtasks, then subtask i is responsible for
          * cleaning all subtasks j in [0; X), where j % Y = i. For example, if we downscale to 2,
          * then subtask 0 is responsible for all even and subtask 1 for all odd subtasks.
+         *
+         * <p>The walk over these subtasks ends at the first subtask for which it finds no used
+         * transactional id. Transactions of the subtasks behind that one are not found.
          */
         private void abortTransactionsWithPrefix(String prefix, Context context) {
             for (int subtaskId = context.getCurrentSubtaskId();

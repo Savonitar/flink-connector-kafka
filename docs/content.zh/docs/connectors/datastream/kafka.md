@@ -583,6 +583,34 @@ KafkaRecordSerializationSchema.builder() \
   完成时才会可见，因此请按需调整 checkpoint 的间隔。请确认事务 ID 的前缀（transactionIdPrefix）对不同的应用是唯一的，以保证不同作业的事务
   不会互相影响！此外，强烈建议将 Kafka 的事务超时时间调整至远大于 checkpoint 最大间隔 + 最大重启时间，否则 Kafka 对未提交事务的过期处理会导致数据丢失。
 
+#### 遗留事务
+
+未被关闭就消失的 writer（例如其所在的 TaskManager 丢失）可能会留下它正在写入的、尚未结束的 Kafka 事务。Kafka 不会让分区的
+last stable offset 越过未结束事务的第一条数据，因此使用 `isolation.level=read_committed` 的 consumer 读不到这条数据之后的任何内容，
+包括其他事务随后提交的数据。为了避免这种情况，使用 ```DeliveryGuarantee.EXACTLY_ONCE``` 的 sink 中的每个 writer
+在启动时都会先中止之前的执行尝试（attempt）没有结束的事务。writer 查找这些事务的方式由 ```TransactionNamingStrategy``` 决定，
+可以通过 ```setTransactionNamingStrategy(TransactionNamingStrategy)``` 设置：
+
+- ```TransactionNamingStrategy.INCREMENTING```（默认）：writer 会重新初始化自恢复所用的 checkpoint 之后，之前的执行尝试可能使用过的事务 ID，
+  这会中止这些事务 ID 上的事务。为了覆盖之前以更多 subtask 运行的执行尝试，每个 subtask 会依次处理由它负责的 subtask 编号：
+  从自己的编号开始，每一步加上当前的并行度，并在第一个找不到已使用事务 ID 的编号处停止。因此，如果途中有一个编号自恢复所用的
+  checkpoint 之后从未被使用过，编号更大的 subtask 的事务就不会被发现。例如：某次执行尝试在完成第一个 checkpoint 之前结束，
+  此时部分 subtask 尚未创建 writer，一个编号更大的 writer 所在的 TaskManager 丢失，并且下一次执行尝试以更少的 subtask 运行。
+  未被发现的事务会一直处于未结束状态，直到之后的某次执行尝试找到它，或者最迟到 broker 在其 `transaction.timeout.ms`
+  到期后将其中止（除非另行配置，sink 将其设置为 1 小时）。因此，上文建议设置的较大的事务超时时间，也会延长这样的事务阻塞
+  `read_committed` consumer 的时间。作业的输出仍然是完整的：这种事务中的数据是在最后一个完成的 checkpoint 之后写入的，
+  重启后的作业会在新的事务中重新写入这些数据。但 `read_committed` consumer 能读到的数据并没有同样的保障：Kafka 会对
+  high watermark 之前的所有日志段应用 topic 的保留策略，未结束的事务并不能保住它之后的日志段。如果在该事务仍未结束时达到了
+  topic 保留策略的时间或大小限制（`retention.ms`、`retention.bytes`），在它的第一条数据之后提交的数据可能在这些 consumer
+  被允许读取之前就已经被删除。
+- ```TransactionNamingStrategy.POOLING```：writer 会向 broker 查询目标 topic 上未结束的事务，并中止其中属于该 sink 且由当前
+  subtask 负责的事务，上面例子中的事务也包括在内。该策略要求 Kafka 3.0 及以上版本以及对目标 topic 的读权限。此外，writer
+  启动时必须已知目标 topic：```setTopic(String)``` 会提供目标 topic；```TopicSelector``` 只有在同时实现了
+  ```KafkaDatasetIdentifierProvider``` 时才会提供；自定义的序列化器只有在实现了 ```KafkaDatasetFacetProvider```
+  并返回其 topic 或 topic pattern 时才会提供。如果像上面的示例那样给 ```setTopicSelector``` 传入 lambda，sink 可以构建成功，
+  但每个 writer 在启动时都会失败，并报错 "The record serializer does not expose a static list of target topics."。
+  作业无法从 ```POOLING``` 切换回 ```INCREMENTING```。
+
 ### 监控
 
 Kafka sink 会在不同的[范围（Scope）]({{< ref "docs/ops/metrics" >}}/#scope)中汇报下列指标。

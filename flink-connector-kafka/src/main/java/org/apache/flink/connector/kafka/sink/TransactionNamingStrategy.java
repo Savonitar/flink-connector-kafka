@@ -41,6 +41,29 @@ public enum TransactionNamingStrategy {
      * <p>This is exactly the same behavior as in flink-connector-kafka 3.X.
      *
      * <p>Switching to this strategy from {@link #POOLING} is not supported.
+     *
+     * <p>When a writer starts, it aborts the transactions that earlier attempts did not finish.
+     * With this strategy it finds them by re-initializing the transactional ids that earlier
+     * attempts may have used since the restored checkpoint. Each subtask goes through the subtask
+     * numbers it is responsible for and ends at the first number for which it finds no used
+     * transactional id. It therefore misses the transactions of higher subtask numbers if a number
+     * on its way was never used since the restored checkpoint. An example: an attempt ends before
+     * its first checkpoint while some of its subtasks have not created their writer yet, a writer
+     * with a higher subtask number is lost without being closed, and the next attempt runs with
+     * fewer subtasks.
+     *
+     * <p>A missed transaction remains unfinished until a later attempt comes across it or, at the
+     * latest, until the broker aborts it once its transaction timeout has elapsed. During that time
+     * the last stable offset of the partitions it wrote to does not advance, so {@code
+     * read_committed} consumers receive nothing from behind it. The output of the job stays
+     * complete, because the restarted job writes the records of such a transaction again. What
+     * these consumers get to read is not protected in the same way: Kafka applies the retention of
+     * a topic to all log segments below the high watermark, and an unfinished transaction does not
+     * keep the segments that follow it. If the time or size limit of the topic's retention ({@code
+     * retention.ms}, {@code retention.bytes}) is reached while the transaction is unfinished,
+     * records that were committed after its first record can be deleted before these consumers were
+     * allowed to read them. {@link #POOLING} finds such a transaction because it asks the brokers
+     * for the unfinished transactions.
      */
     INCREMENTING(TransactionNamingStrategyImpl.INCREMENTING, TransactionAbortStrategyImpl.PROBING),
 
@@ -49,7 +72,11 @@ public enum TransactionNamingStrategy {
      * #INCREMENTING} on the Kafka broker.
      *
      * <p>It's a new strategy introduced in flink-connector-kafka 4.X. It requires Kafka 3.0+ and
-     * additional read permissions on the target topics.
+     * additional read permissions on the target topics. The target topics must also be known when a
+     * writer starts: {@code setTopic(String)} of the {@link KafkaRecordSerializationSchemaBuilder}
+     * provides them, a {@link TopicSelector} only if it also implements {@code
+     * KafkaDatasetIdentifierProvider}, and a serializer of your own only if it implements {@code
+     * KafkaDatasetFacetProvider} and returns its topics or a topic pattern.
      *
      * <p>The recommended way to switch to this strategy is to first take a checkpoint with
      * flink-connector-kafka 4.X and then switch to this strategy. This will ensure that no

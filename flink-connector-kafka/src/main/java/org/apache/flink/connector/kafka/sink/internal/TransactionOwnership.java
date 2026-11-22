@@ -45,6 +45,11 @@ import static org.apache.flink.util.Preconditions.checkState;
  * upscaled to 5 but then a failure happens. We need to have at least 5 open transactions. If the
  * application is finally resumed from the checkpoint with 3 subtasks again. These 3 subtasks need
  * to assume ownership of the remaining 2.
+ *
+ * <p>For the cleanup at the start of a writer, ownership defines which subtask has to abort a
+ * transaction that an earlier attempt did not finish. Whether that subtask finds the transaction is
+ * up to the {@link TransactionAbortStrategyImpl}; see {@link TransactionAbortStrategyImpl#PROBING}
+ * for the transactions that it misses.
  */
 @Internal
 public enum TransactionOwnership {

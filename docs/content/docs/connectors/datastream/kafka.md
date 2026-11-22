@@ -677,6 +677,49 @@ an explanation of the different guarantees.
   transaction.timeout.ms)>> maximum checkpoint duration + maximum restart duration or data loss may
   happen when Kafka expires an uncommitted transaction. 
 
+#### Lingering Transactions
+
+A writer that goes away without being closed, for example because its TaskManager is lost, can
+leave the Kafka transaction it was writing to unfinished. Kafka does not move the last stable
+offset of a partition past the first record of an unfinished transaction, so a consumer with
+`isolation.level=read_committed` receives nothing from behind that record, including records that
+other transactions commit afterwards. To prevent this, every writer of a sink with
+```DeliveryGuarantee.EXACTLY_ONCE``` first aborts the transactions that earlier attempts did not
+finish. The ```TransactionNamingStrategy```, set with
+```setTransactionNamingStrategy(TransactionNamingStrategy)```, decides how the writer finds them:
+
+- ```TransactionNamingStrategy.INCREMENTING``` (default): The writer re-initializes the
+  transactional ids that earlier attempts may have used since the restored checkpoint, which
+  aborts their transactions. To cover an earlier attempt that ran with more subtasks, each subtask
+  goes through the subtask numbers it is responsible for, starting with its own and adding the
+  current parallelism at each step, and ends at the first number for which it finds no used
+  transactional id. It therefore misses the transactions of higher subtask numbers if a number on
+  its way was never used since the restored checkpoint. An example: an attempt ends before its
+  first checkpoint while some of its subtasks have not created their writer yet, the TaskManager of
+  a writer with a higher subtask number is lost, and the next attempt runs with fewer subtasks. A
+  missed transaction remains unfinished until a later attempt comes across it or, at the latest,
+  until the broker aborts it once its `transaction.timeout.ms` has elapsed (1 hour unless the sink
+  is configured otherwise). The large transaction timeout that is recommended above therefore also
+  lengthens the time for which such a transaction can hold up `read_committed` consumers. The
+  output of the job stays complete: the records of such a transaction were written after the last
+  completed checkpoint, and the restarted job writes them again in a new transaction. What
+  `read_committed` consumers get to read is not protected in the same way: Kafka applies the
+  retention of a topic to all log segments below the high watermark, and an unfinished transaction
+  does not keep the segments that follow it. If the time or size limit of the topic's retention
+  (`retention.ms`, `retention.bytes`) is reached while the transaction is unfinished, records that
+  were committed after its first record can be deleted before these consumers were allowed to read
+  them.
+- ```TransactionNamingStrategy.POOLING```: The writer asks the brokers for the unfinished
+  transactions on the target topics and aborts those of this sink that its subtask is responsible
+  for, which covers the example above. This strategy requires Kafka 3.0+ and read permissions on
+  the target topics. It also needs to know the target topics when a writer starts:
+  ```setTopic(String)``` provides them, a ```TopicSelector``` only if it also implements
+  ```KafkaDatasetIdentifierProvider```, and a serializer of your own only if it implements
+  ```KafkaDatasetFacetProvider``` and returns its topics or a topic pattern. With a
+  ```setTopicSelector``` lambda as in the example above, the sink can be built, but every writer
+  fails when it starts with "The record serializer does not expose a static list of target
+  topics.". A job cannot switch from ```POOLING``` back to ```INCREMENTING```.
+
 ### Monitoring
 
 Kafka sink exposes the following metrics in the respective [scope]({{< ref "docs/ops/metrics" >}}/#scope).
