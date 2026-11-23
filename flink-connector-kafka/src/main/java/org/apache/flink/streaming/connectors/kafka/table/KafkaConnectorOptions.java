@@ -287,8 +287,9 @@ public class KafkaConnectorOptions {
      * consumption on the broker because each unique transaction name requires the broker to keep
      * some metadata in memory for 7 days.
      *
-     * <p>All naming strategies use the format {@code transactionalIdPrefix-subtask-offset} where
-     * offset is calculated differently.
+     * <p>All naming strategies use the format {@code
+     * transactionalIdPrefix-checkpoint_subtask_attempt-subtask-offset} where offset is calculated
+     * differently, see {@link TransactionNamingStrategy}.
      */
     public static final ConfigOption<TransactionNamingStrategy> TRANSACTION_NAMING_STRATEGY =
             ConfigOptions.key("sink.transaction-naming-strategy")

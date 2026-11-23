@@ -23,11 +23,17 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.apache.flink.api.connector.sink2.InitContext.INITIAL_CHECKPOINT_ID;
 import static org.apache.flink.connector.kafka.sink.internal.TransactionAbortStrategyImpl.LISTING;
+import static org.apache.flink.connector.kafka.sink.internal.TransactionAbortStrategyImpl.PROBING;
+import static org.apache.flink.connector.kafka.sink.internal.TransactionalIdFactory.buildAttemptScopedPrefix;
+import static org.apache.flink.connector.kafka.sink.internal.TransactionalIdFactory.buildTransactionalId;
 import static org.apache.flink.connector.kafka.sink.internal.TransactionalIdFactory.extractSubtaskId;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -131,6 +137,162 @@ class TransactionAbortStrategyImplTest {
             LISTING.abortTransactions(testContext);
             assertThat(testContext.getAbortedTransactions()).containsExactlyInAnyOrder(t31, t32);
         }
+
+        @Test
+        void testAbortsEarlierAttemptsOfSameCheckpoint() {
+            TestContext testContext = new TestContext();
+            testContext.setSubtaskIdAndParallelism(0, 2);
+            testContext.setOwnedSubtaskIdsAndMaxParallelism(0, 2);
+            testContext.setAttempt(5, 0, 2);
+
+            // an attempt of a previous JobManager that had the scope of this attempt
+            String own = testContext.addOpenTransaction(testContext.getAttemptScopedPrefix(), 0);
+            String earlier1 = testContext.addOpenTransaction(scope(5, 0, 1), 0);
+            // an earlier attempt of this subtask owns every transaction under its prefix
+            String earlier0 = testContext.addOpenTransaction(scope(5, 0, 0), 1);
+
+            LISTING.abortTransactions(testContext);
+            assertThat(testContext.getAbortedTransactions())
+                    .containsExactlyInAnyOrder(own, earlier1, earlier0);
+        }
+
+        @Test
+        void testSparesLaterAttemptsAndOtherExecutions() {
+            TestContext testContext = new TestContext();
+            testContext.clearPrefixesToAbort();
+            testContext.setSubtaskIdAndParallelism(0, 2);
+            testContext.setOwnedSubtaskIdsAndMaxParallelism(0, 2);
+            testContext.setAttempt(5, 0, 2);
+
+            testContext.addOpenTransaction(scope(5, 0, 3), 0); // later attempt
+            testContext.addOpenTransaction(scope(5, 0, 10), 0); // starts with an earlier prefix
+            testContext.addOpenTransaction(scope(6, 0, 0), 0); // started from a later checkpoint
+            testContext.addOpenTransaction(scope(4, 0, 1), 0); // not in the recovered state
+            testContext.addOpenTransaction(scope(5, 1, 0), 0); // attempt of another subtask
+            testContext.addOpenTransaction(PREFIX, 0); // no scope, not in the recovered state
+
+            LISTING.abortTransactions(testContext);
+            assertThat(testContext.getAbortedTransactions()).isEmpty();
+        }
+
+        @Test
+        void testAbortsOwnedTransactionsOfRecoveredAttempt() {
+            TestContext testContext = new TestContext();
+            testContext.setSubtaskIdAndParallelism(0, 2);
+            testContext.setOwnedSubtaskIdsAndMaxParallelism(0, 2);
+            testContext.setAttempt(5, 0, 2);
+            String recovered = scope(3, 0, 1);
+            testContext.addRestoredAttemptScopedPrefix(recovered, 0);
+
+            testContext.addPrecommittedTransactionalId(recovered, 0, 0);
+            String open = testContext.addOpenTransaction(recovered, 0, 1);
+            // the state of the writer was split: another subtask owns this transaction
+            testContext.addOpenTransaction(recovered, 1, 0);
+
+            LISTING.abortTransactions(testContext);
+            assertThat(testContext.getAbortedTransactions()).containsExactly(open);
+        }
+
+        @Test
+        void testIgnoresTransactionsOfOtherApplications() {
+            TestContext testContext = new TestContext();
+            testContext.setSubtaskIdAndParallelism(0, 1);
+            testContext.setOwnedSubtaskIdsAndMaxParallelism(0, 1);
+
+            testContext.addOpenTransactionalId("other-application");
+            testContext.addOpenTransactionalId(PREFIX);
+            testContext.addOpenTransactionalId(PREFIX + "-a-b");
+
+            LISTING.abortTransactions(testContext);
+            assertThat(testContext.getAbortedTransactions()).isEmpty();
+        }
+    }
+
+    @Nested
+    class Probing {
+        @Test
+        void testProbesPrefixWithoutScopeBySubtaskId() {
+            TestContext testContext = new TestContext();
+            testContext.setSubtaskIdAndParallelism(1, 2);
+            testContext.setStartCheckpointId(6);
+
+            // subtask 3 was removed by downscaling
+            testContext.addUsedTransactionalIds(PREFIX, 1, 6, 7);
+            testContext.addUsedTransactionalIds(PREFIX, 3, 6);
+
+            PROBING.abortTransactions(testContext);
+            assertThat(testContext.getAbortedTransactions())
+                    .contains(
+                            buildTransactionalId(PREFIX, 1, 6),
+                            buildTransactionalId(PREFIX, 1, 7),
+                            buildTransactionalId(PREFIX, 3, 6));
+        }
+
+        @Test
+        void testProbesRecoveredAttemptWithItsSubtaskId() {
+            TestContext testContext = new TestContext();
+            testContext.clearPrefixesToAbort();
+            testContext.setSubtaskIdAndParallelism(0, 1);
+            testContext.setAttempt(5, 0, 2);
+            testContext.setStartCheckpointId(6);
+            // the writer of subtask 1 wrote the state that subtask 0 recovered after downscaling
+            String recovered = scope(3, 1, 0);
+            testContext.addRestoredAttemptScopedPrefix(recovered, 1);
+            testContext.addUsedTransactionalIds(recovered, 1, 6, 7);
+
+            PROBING.abortTransactions(testContext);
+            assertThat(testContext.getAbortedTransactions())
+                    .containsExactlyInAnyOrder(
+                            // the first unused id ends the probing of a prefix
+                            buildTransactionalId(testContext.getAttemptScopedPrefix(), 0, 6),
+                            buildTransactionalId(recovered, 1, 6),
+                            buildTransactionalId(recovered, 1, 7),
+                            buildTransactionalId(recovered, 1, 8),
+                            // the earlier attempts of subtask 0 have not opened a transaction
+                            buildTransactionalId(scope(5, 0, 1), 0, 6),
+                            buildTransactionalId(scope(5, 0, 0), 0, 6));
+        }
+
+        @Test
+        void testStopsAtEarlierAttemptThatStartedItsWriter() {
+            TestContext testContext = new TestContext();
+            testContext.clearPrefixesToAbort();
+            testContext.setSubtaskIdAndParallelism(0, 1);
+            testContext.setAttempt(5, 0, 3);
+            testContext.setStartCheckpointId(6);
+            // attempt 2 failed before it created its writer, attempt 1 has aborted for attempt 0
+            testContext.addUsedTransactionalIds(scope(5, 0, 1), 0, 6);
+            testContext.addUsedTransactionalIds(scope(5, 0, 0), 0, 6);
+
+            PROBING.abortTransactions(testContext);
+            assertThat(testContext.getAbortedTransactions())
+                    .containsExactlyInAnyOrder(
+                            buildTransactionalId(testContext.getAttemptScopedPrefix(), 0, 6),
+                            buildTransactionalId(scope(5, 0, 2), 0, 6),
+                            buildTransactionalId(scope(5, 0, 1), 0, 6),
+                            buildTransactionalId(scope(5, 0, 1), 0, 7));
+        }
+
+        @Test
+        void testNeverProbesLaterAttempt() {
+            TestContext testContext = new TestContext();
+            testContext.clearPrefixesToAbort();
+            testContext.setSubtaskIdAndParallelism(0, 1);
+            testContext.setAttempt(5, 0, 1);
+            testContext.setStartCheckpointId(6);
+            // a later attempt runs and has opened its transactions
+            testContext.addUsedTransactionalIds(scope(5, 0, 2), 0, 6, 7);
+            testContext.addUsedTransactionalIds(scope(5, 0, 0), 0, 6);
+
+            PROBING.abortTransactions(testContext);
+            assertThat(testContext.getAbortedTransactions())
+                    .isNotEmpty()
+                    .noneMatch(id -> id.startsWith(scope(5, 0, 2)));
+        }
+    }
+
+    private static String scope(long restoredCheckpointId, int subtaskIndex, int attemptNumber) {
+        return buildAttemptScopedPrefix(PREFIX, restoredCheckpointId, subtaskIndex, attemptNumber);
     }
 
     static final class TestContext implements TransactionAbortStrategyImpl.Context {
@@ -143,6 +305,10 @@ class TransactionAbortStrategyImplTest {
         private int maxParallelism;
         private String prefix = PREFIX;
         private final Set<String> prefixesToAbort = new HashSet<>(Set.of(prefix));
+        private String attemptScopedPrefix = scope(0, 0, 0);
+        private final Set<String> usedTransactionalIds = new HashSet<>();
+        private final List<String> prefixesOfEarlierAttempts = new ArrayList<>();
+        private final Map<String, Set<Integer>> restoredAttemptScopedPrefixes = new HashMap<>();
         private long startCheckpointId = INITIAL_CHECKPOINT_ID;
 
         public void setPrefix(String prefix) {
@@ -152,6 +318,50 @@ class TransactionAbortStrategyImplTest {
 
         public Collection<String> getAbortedTransactions() {
             return abortedTransactions;
+        }
+
+        /** Sets the scope of the attempt and its earlier attempts on the same checkpoint. */
+        public void setAttempt(long restoredCheckpointId, int subtaskIndex, int attemptNumber) {
+            this.attemptScopedPrefix = scope(restoredCheckpointId, subtaskIndex, attemptNumber);
+            this.prefixesOfEarlierAttempts.clear();
+            for (int attempt = attemptNumber - 1; attempt >= 0; attempt--) {
+                this.prefixesOfEarlierAttempts.add(
+                        scope(restoredCheckpointId, subtaskIndex, attempt));
+            }
+        }
+
+        public void addRestoredAttemptScopedPrefix(String prefix, int subtaskId) {
+            restoredAttemptScopedPrefixes
+                    .computeIfAbsent(prefix, p -> new HashSet<>())
+                    .add(subtaskId);
+        }
+
+        public void clearPrefixesToAbort() {
+            prefixesToAbort.clear();
+        }
+
+        /** Ids that a producer has been initialized with; probing gets a non-zero epoch. */
+        public void addUsedTransactionalIds(String prefix, int subtaskId, long... offsets) {
+            for (long offset : offsets) {
+                usedTransactionalIds.add(buildTransactionalId(prefix, subtaskId, offset));
+            }
+        }
+
+        public String addOpenTransaction(String prefix, int subtaskId) {
+            return addOpenTransaction(prefix, subtaskId, 0);
+        }
+
+        public String addOpenTransaction(String prefix, int subtaskId, long offset) {
+            return addOpenTransactionalId(buildTransactionalId(prefix, subtaskId, offset));
+        }
+
+        public String addOpenTransactionalId(String transactionalId) {
+            openTransactionalIds.add(transactionalId);
+            return transactionalId;
+        }
+
+        public void addPrecommittedTransactionalId(String prefix, int subtaskId, long offset) {
+            precommittedTransactionalIds.add(addOpenTransaction(prefix, subtaskId, offset));
         }
 
         public String addPrecommittedTransactionalIds(int oldSubtaskId, long checkpointId) {
@@ -187,6 +397,21 @@ class TransactionAbortStrategyImplTest {
         }
 
         @Override
+        public String getAttemptScopedPrefix() {
+            return this.attemptScopedPrefix;
+        }
+
+        @Override
+        public List<String> getPrefixesOfEarlierAttempts() {
+            return this.prefixesOfEarlierAttempts;
+        }
+
+        @Override
+        public Map<String, Set<Integer>> getRestoredAttemptScopedPrefixes() {
+            return this.restoredAttemptScopedPrefixes;
+        }
+
+        @Override
         public Set<String> getPrecommittedTransactionalIds() {
             return this.precommittedTransactionalIds;
         }
@@ -204,7 +429,7 @@ class TransactionAbortStrategyImplTest {
         public TransactionAbortStrategyImpl.TransactionAborter getTransactionAborter() {
             return transactionalId -> {
                 abortedTransactions.add(transactionalId);
-                return 0;
+                return usedTransactionalIds.contains(transactionalId) ? 1 : 0;
             };
         }
 

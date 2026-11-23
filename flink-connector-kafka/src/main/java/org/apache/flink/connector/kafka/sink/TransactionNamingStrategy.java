@@ -28,8 +28,13 @@ import org.apache.flink.connector.kafka.sink.internal.TransactionNamingStrategyI
  * on the broker because each unique transaction name requires the broker to keep some metadata in
  * memory for 7 days.
  *
- * <p>All naming strategies use the format {@code transactionalIdPrefix-subtask-offset} where offset
- * is calculated differently.
+ * <p>All naming strategies use the format {@code
+ * transactionalIdPrefix-checkpoint_subtask_attempt-subtask-offset}. The second part scopes the name
+ * to one execution attempt of the writer. It consists of the id of the checkpoint that the attempt
+ * started from (0 if it started without one), the index of its subtask and its attempt number. Two
+ * attempts that a JobManager starts for a subtask therefore never use the same name, so that an
+ * attempt that is still alive cannot end the transaction of a later attempt by opening its own. The
+ * offset is calculated differently by each strategy.
  */
 @PublicEvolving
 public enum TransactionNamingStrategy {
@@ -38,7 +43,7 @@ public enum TransactionNamingStrategy {
      * corresponds to the checkpoint id. This strategy is wasteful in terms of resource consumption
      * on the broker.
      *
-     * <p>This is exactly the same behavior as in flink-connector-kafka 3.X.
+     * <p>The offsets are the same as in flink-connector-kafka 3.X.
      *
      * <p>Switching to this strategy from {@link #POOLING} is not supported.
      */
@@ -46,7 +51,8 @@ public enum TransactionNamingStrategy {
 
     /**
      * This strategy reuses transaction names. It is more resource-friendly than {@link
-     * #INCREMENTING} on the Kafka broker.
+     * #INCREMENTING} on the Kafka broker. An execution attempt reuses its own names only, so the
+     * number of names grows with the number of restarts instead of the number of checkpoints.
      *
      * <p>It's a new strategy introduced in flink-connector-kafka 4.X. It requires Kafka 3.0+ and
      * additional read permissions on the target topics.

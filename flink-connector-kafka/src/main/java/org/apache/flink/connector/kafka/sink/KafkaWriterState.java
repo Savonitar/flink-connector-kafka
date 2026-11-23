@@ -32,7 +32,15 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
 public class KafkaWriterState {
     public static final int UNKNOWN = -1;
 
+    /**
+     * The prefix under which the writer of this state named its transactions. It is scoped to the
+     * execution attempt of that writer, see {@link
+     * org.apache.flink.connector.kafka.sink.internal.TransactionalIdFactory#buildAttemptScopedPrefix(String,
+     * long, int, int)}. State of a version that did not scope transactional ids holds the prefix as
+     * it was configured for the sink.
+     */
     private final String transactionalIdPrefix;
+
     private final int ownedSubtaskId;
     private final int totalNumberOfOwnedSubtasks;
     private final TransactionOwnership transactionOwnership;

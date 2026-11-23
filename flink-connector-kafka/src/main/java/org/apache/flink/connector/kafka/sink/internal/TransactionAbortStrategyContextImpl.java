@@ -28,6 +28,7 @@ import org.apache.kafka.clients.admin.TransactionListing;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -45,6 +46,9 @@ public class TransactionAbortStrategyContextImpl implements TransactionAbortStra
     private final Set<Integer> ownedSubtaskIds;
     private final int totalNumberOfOwnedSubtasks;
     private final Set<String> prefixesToAbort;
+    private final String attemptScopedPrefix;
+    private final List<String> prefixesOfEarlierAttempts;
+    private final Map<String, Set<Integer>> restoredAttemptScopedPrefixes;
     private final long startCheckpointId;
     private final TransactionAborter transactionAborter;
 
@@ -58,7 +62,10 @@ public class TransactionAbortStrategyContextImpl implements TransactionAbortStra
             int currentParallelism,
             int[] ownedSubtaskIds,
             int totalNumberOfOwnedSubtasks,
-            List<String> prefixesToAbort,
+            Collection<String> prefixesToAbort,
+            String attemptScopedPrefix,
+            List<String> prefixesOfEarlierAttempts,
+            Map<String, Set<Integer>> restoredAttemptScopedPrefixes,
             long startCheckpointId,
             TransactionAborter transactionAborter,
             Supplier<Admin> adminSupplier,
@@ -69,6 +76,10 @@ public class TransactionAbortStrategyContextImpl implements TransactionAbortStra
         this.ownedSubtaskIds = Arrays.stream(ownedSubtaskIds).boxed().collect(Collectors.toSet());
         this.totalNumberOfOwnedSubtasks = totalNumberOfOwnedSubtasks;
         this.prefixesToAbort = Set.copyOf(prefixesToAbort);
+        this.attemptScopedPrefix =
+                checkNotNull(attemptScopedPrefix, "attemptScopedPrefix must not be null");
+        this.prefixesOfEarlierAttempts = List.copyOf(prefixesOfEarlierAttempts);
+        this.restoredAttemptScopedPrefixes = Map.copyOf(restoredAttemptScopedPrefixes);
         this.startCheckpointId = startCheckpointId;
         this.transactionAborter =
                 checkNotNull(transactionAborter, "transactionAborter must not be null");
@@ -107,6 +118,21 @@ public class TransactionAbortStrategyContextImpl implements TransactionAbortStra
     @Override
     public Set<String> getPrefixesToAbort() {
         return prefixesToAbort;
+    }
+
+    @Override
+    public String getAttemptScopedPrefix() {
+        return attemptScopedPrefix;
+    }
+
+    @Override
+    public List<String> getPrefixesOfEarlierAttempts() {
+        return prefixesOfEarlierAttempts;
+    }
+
+    @Override
+    public Map<String, Set<Integer>> getRestoredAttemptScopedPrefixes() {
+        return restoredAttemptScopedPrefixes;
     }
 
     @Override

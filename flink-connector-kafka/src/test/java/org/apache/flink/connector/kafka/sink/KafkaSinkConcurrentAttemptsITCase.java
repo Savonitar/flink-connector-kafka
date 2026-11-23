@@ -105,10 +105,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * for the heartbeat to the JobManager.
  *
  * <p>The slow attempt is released when a later attempt has flushed and pre-committed records for a
- * checkpoint that is not complete yet. All attempts of a subtask that start from the same
- * checkpoint use the same transactional ids, so the writer that the slow attempt initializes now
- * meets the transaction of the later attempt. The test covers attempts that start without a
- * checkpoint and attempts that restore one.
+ * checkpoint that is not complete yet. The writer that the slow attempt initializes now aborts the
+ * transactions of earlier executions and opens its own, and it has to leave the transaction of the
+ * later attempt alone. The test covers attempts that start without a checkpoint and attempts that
+ * restore one.
  */
 @Testcontainers
 class KafkaSinkConcurrentAttemptsITCase {
@@ -156,9 +156,6 @@ class KafkaSinkConcurrentAttemptsITCase {
      * Tests that every record of the source is committed exactly once when an earlier attempt of
      * the sink subtask initializes its writer while a later attempt waits for the completion of a
      * checkpoint. The earlier writer may start or refuse to start; the test accepts both.
-     *
-     * <p>KNOWN, OPEN DEFECT: this test is expected to fail until writers of different attempts of a
-     * subtask can no longer end each other's transactions.
      */
     @ParameterizedTest(name = "{0}, attemptsRestoreCheckpoint={1}")
     @MethodSource("namingStrategiesAndStartingPoints")
@@ -254,10 +251,9 @@ class KafkaSinkConcurrentAttemptsITCase {
                 .hasSize(RECORD_COUNT);
         assertThat(committedRecords)
                 .as(
-                        "KNOWN, OPEN DEFECT - this failure is expected until it is fixed: "
-                                + "the writer of the earlier attempt ended the transaction that "
-                                + "a later attempt had pre-committed for a checkpoint; the "
-                                + "checkpoint completed, so its records are never committed")
+                        "committed records; a missing record means that the writer of the "
+                                + "earlier attempt ended the transaction that a later attempt "
+                                + "had pre-committed for a checkpoint")
                 .containsExactlyInAnyOrderElementsOf(controls.get().emittedRecords);
     }
 
@@ -601,10 +597,9 @@ class KafkaSinkConcurrentAttemptsITCase {
                     && checkpointId >= checkpointWithoutPendingTransactions) {
                 // An attempt before the slow one writes one batch and fails here, so that the
                 // following attempts restore a checkpoint. The writer state of that checkpoint
-                // must not list a pre-committed transaction: the cleanup of a restored writer
-                // spares the ids of such transactions, and a later attempt uses these ids again.
-                // The slow attempt would then leave a transaction of the later attempt alone
-                // that happens to have such an id, and the test would not show the defect.
+                // lists no pre-committed transaction. The cleanup of a restored writer spares
+                // the transactions of that list, and the test must not pass because the slow
+                // attempt spares a transaction for that reason.
                 throw new IllegalStateException(
                         "Planned failure after a checkpoint without pending transactions");
             }

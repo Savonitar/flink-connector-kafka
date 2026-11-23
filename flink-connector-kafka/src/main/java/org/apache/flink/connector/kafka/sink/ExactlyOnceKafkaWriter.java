@@ -37,6 +37,8 @@ import org.apache.flink.connector.kafka.sink.internal.TransactionFinished;
 import org.apache.flink.connector.kafka.sink.internal.TransactionNamingStrategyContextImpl;
 import org.apache.flink.connector.kafka.sink.internal.TransactionNamingStrategyImpl;
 import org.apache.flink.connector.kafka.sink.internal.TransactionOwnership;
+import org.apache.flink.connector.kafka.sink.internal.TransactionalIdFactory;
+import org.apache.flink.connector.kafka.sink.internal.TransactionalIdFactory.AttemptScope;
 import org.apache.flink.connector.kafka.util.AdminUtils;
 import org.apache.flink.runtime.checkpoint.CheckpointIDCounter;
 import org.apache.flink.util.FlinkRuntimeException;
@@ -54,10 +56,14 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.util.IOUtils.closeAll;
@@ -77,6 +83,18 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
     private final String transactionalIdPrefix;
 
     /**
+     * Prefix of the transactional ids of this execution attempt: {@link #transactionalIdPrefix}
+     * followed by the restored checkpoint, the subtask index and the attempt number. No other
+     * attempt that the JobManager starts has this prefix, so this writer and the writer of another
+     * attempt that is alive at the same time cannot end each other's transactions by opening their
+     * own.
+     */
+    private final String attemptScopedPrefix;
+
+    private final int subtaskId;
+    private final int attemptNumber;
+
+    /**
      * Strategy to abort lingering transactions from previous executions during writer
      * initialization.
      */
@@ -86,6 +104,10 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
     private final TransactionNamingStrategyImpl transactionNamingStrategy;
 
     private final Collection<KafkaWriterState> recoveredStates;
+
+    /** Ids of the transactions that the recovered state hands over to the committer. */
+    private final Set<String> recoveredTransactionalIds;
+
     private final long restoredCheckpointId;
 
     /**
@@ -157,9 +179,17 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
         }
 
         this.recoveredStates = checkNotNull(recoveredStates, "recoveredStates");
+        this.recoveredTransactionalIds =
+                recoveredStates.stream()
+                        .flatMap(
+                                state ->
+                                        state.getPrecommittedTransactionalIds().stream()
+                                                .map(CheckpointTransaction::getTransactionalId))
+                        .collect(Collectors.toSet());
         TaskInfo taskInfo = sinkInitContext.getTaskInfo();
         TransactionOwnership ownership = transactionNamingStrategy.getOwnership();
-        int subtaskId = taskInfo.getIndexOfThisSubtask();
+        this.subtaskId = taskInfo.getIndexOfThisSubtask();
+        this.attemptNumber = taskInfo.getAttemptNumber();
         int parallelism = taskInfo.getNumberOfParallelSubtasks();
         this.ownedSubtaskIds =
                 ownership.getOwnedSubtaskIds(subtaskId, parallelism, recoveredStates);
@@ -170,6 +200,9 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
                 sinkInitContext
                         .getRestoredCheckpointId()
                         .orElse(CheckpointIDCounter.INITIAL_CHECKPOINT_ID - 1);
+        this.attemptScopedPrefix =
+                TransactionalIdFactory.buildAttemptScopedPrefix(
+                        transactionalIdPrefix, restoredCheckpointId, subtaskId, attemptNumber);
         this.producerPool =
                 new ProducerPoolImpl(
                         kafkaProducerConfig,
@@ -179,11 +212,10 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
                                 .collect(Collectors.toList()));
         this.backchannel =
                 BackchannelFactory.getInstance()
-                        .getReadableBackchannel(
-                                subtaskId, taskInfo.getAttemptNumber(), transactionalIdPrefix);
+                        .getReadableBackchannel(subtaskId, attemptNumber, transactionalIdPrefix);
         this.namingContext =
                 new TransactionNamingStrategyContextImpl(
-                        transactionalIdPrefix,
+                        attemptScopedPrefix,
                         this.ownedSubtaskIds[0],
                         restoredCheckpointId,
                         producerPool);
@@ -239,8 +271,17 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
         // recycle committed producers
         TransactionFinished finishedTransaction;
         while ((finishedTransaction = backchannel.poll()) != null) {
-            producerPool.recycleByTransactionId(
-                    finishedTransaction.getTransactionId(), finishedTransaction.isSuccess());
+            final String transactionalId = finishedTransaction.getTransactionId();
+            producerPool.recycleByTransactionId(transactionalId, finishedTransaction.isSuccess());
+            if (!finishedTransaction.isSuccess()
+                    && recoveredTransactionalIds.contains(transactionalId)) {
+                // The committer could not commit a transaction of the recovered state, so another
+                // transaction may be open under its id: the attempt that wrote the state may have
+                // used the id again for a transaction that no checkpoint covers. The cleanup at
+                // the start spared the id for the committer, and this writer does not use ids of
+                // that attempt, so the transaction has to be aborted here.
+                abortTransaction(transactionalId);
+            }
         }
         // persist the ongoing transactions into the state; these will not be aborted on restart
         Collection<CheckpointTransaction> ongoingTransactions =
@@ -257,7 +298,9 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
             int ownedSubtask = subtaskIds[index];
             states.add(
                     new KafkaWriterState(
-                            transactionalIdPrefix,
+                            // the writer that restores this state finds the transactions of this
+                            // attempt under this prefix
+                            attemptScopedPrefix,
                             ownedSubtask,
                             totalNumberOfOwnedSubtasks,
                             transactionNamingStrategy.getOwnership(),
@@ -312,65 +355,109 @@ class ExactlyOnceKafkaWriter<IN> extends KafkaWriter<IN> {
 
     private void abortLingeringTransactions(
             Collection<KafkaWriterState> recoveredStates, long startCheckpointId) {
-        List<String> prefixesToAbort = new ArrayList<>();
-        prefixesToAbort.add(transactionalIdPrefix);
-
         LOG.info(
                 "Aborting lingering transactions from previous execution. Recovered states: {}.",
                 recoveredStates);
-        final Optional<KafkaWriterState> lastStateOpt = recoveredStates.stream().findFirst();
-        if (lastStateOpt.isPresent()) {
-            KafkaWriterState lastState = lastStateOpt.get();
-            if (!lastState.getTransactionalIdPrefix().equals(transactionalIdPrefix)) {
-                prefixesToAbort.add(lastState.getTransactionalIdPrefix());
+        // prefixes written by versions that did not scope transactional ids to an attempt
+        final Set<String> unscopedPrefixes = new LinkedHashSet<>();
+        final Map<String, Set<Integer>> restoredAttemptScopedPrefixes = new LinkedHashMap<>();
+        // The checkpoint was written by an attempt, so the attempts of this subtask up to that
+        // one cannot have restored it.
+        int firstAttemptOnRestoredCheckpoint = 0;
+        for (KafkaWriterState state : recoveredStates) {
+            final String restoredPrefix = state.getTransactionalIdPrefix();
+            final Optional<AttemptScope> scope =
+                    TransactionalIdFactory.extractAttemptScope(restoredPrefix);
+            if (scope.isPresent()) {
+                restoredAttemptScopedPrefixes
+                        .computeIfAbsent(restoredPrefix, prefix -> new TreeSet<>())
+                        .add(state.getOwnedSubtaskId());
+                if (isEarlierAttemptOfThisSubtask(scope.get())) {
+                    firstAttemptOnRestoredCheckpoint =
+                            Math.max(
+                                    firstAttemptOnRestoredCheckpoint,
+                                    scope.get().getAttemptNumber() + 1);
+                }
+            } else {
+                unscopedPrefixes.add(restoredPrefix);
+            }
+            final String configuredPrefixOfState =
+                    scope.map(AttemptScope::getTransactionalIdPrefix).orElse(restoredPrefix);
+            if (!configuredPrefixOfState.equals(transactionalIdPrefix)) {
                 LOG.warn(
                         "Transactional id prefix from previous execution {} has changed to {}.",
-                        lastState.getTransactionalIdPrefix(),
+                        configuredPrefixOfState,
                         transactionalIdPrefix);
             }
         }
+        final List<String> prefixesOfEarlierAttempts = new ArrayList<>();
+        for (int attempt = attemptNumber - 1;
+                attempt >= firstAttemptOnRestoredCheckpoint;
+                attempt--) {
+            prefixesOfEarlierAttempts.add(
+                    TransactionalIdFactory.buildAttemptScopedPrefix(
+                            transactionalIdPrefix, restoredCheckpointId, subtaskId, attempt));
+        }
 
         LOG.info(
-                "Aborting lingering transactions with prefixes {} using {}",
-                prefixesToAbort,
+                "Aborting lingering transactions of this attempt's prefix {}, of {} earlier attempts on the same checkpoint, and of the recovered prefixes {} and {} using {}",
+                attemptScopedPrefix,
+                prefixesOfEarlierAttempts.size(),
+                restoredAttemptScopedPrefixes,
+                unscopedPrefixes,
                 transactionAbortStrategy);
         TransactionAbortStrategyContextImpl context =
-                getTransactionAbortStrategyContext(startCheckpointId, prefixesToAbort);
+                getTransactionAbortStrategyContext(
+                        startCheckpointId,
+                        unscopedPrefixes,
+                        prefixesOfEarlierAttempts,
+                        restoredAttemptScopedPrefixes);
         transactionAbortStrategy.abortTransactions(context);
     }
 
+    private boolean isEarlierAttemptOfThisSubtask(AttemptScope scope) {
+        // a JobManager that takes over the job counts the attempts from 0 again, so the attempt
+        // of the state can also have a higher number than this one
+        return scope.getTransactionalIdPrefix().equals(transactionalIdPrefix)
+                && scope.getSubtaskIndex() == subtaskId
+                && scope.getAttemptNumber() < attemptNumber;
+    }
+
     private TransactionAbortStrategyContextImpl getTransactionAbortStrategyContext(
-            long startCheckpointId, List<String> prefixesToAbort) {
-        TransactionAbortStrategyImpl.TransactionAborter aborter =
-                transactionalId -> {
-                    // getTransactionalProducer already calls initTransactions, which cancels the
-                    // transaction
-                    FlinkKafkaInternalProducer<byte[], byte[]> producer =
-                            producerPool.getTransactionalProducer(transactionalId, 0);
-                    LOG.debug("Aborting transaction {}", transactionalId);
-                    producer.flush();
-                    short epoch = producer.getEpoch();
-                    producerPool.recycle(producer);
-                    return epoch;
-                };
-        Set<String> precommittedTransactionalIds =
-                recoveredStates.stream()
-                        .flatMap(
-                                s ->
-                                        s.getPrecommittedTransactionalIds().stream()
-                                                .map(CheckpointTransaction::getTransactionalId))
-                        .collect(Collectors.toSet());
+            long startCheckpointId,
+            Set<String> unscopedPrefixes,
+            List<String> prefixesOfEarlierAttempts,
+            Map<String, Set<Integer>> restoredAttemptScopedPrefixes) {
         return new TransactionAbortStrategyContextImpl(
                 this::getTopicNames,
                 kafkaSinkContext.getParallelInstanceId(),
                 kafkaSinkContext.getNumberOfParallelInstances(),
                 ownedSubtaskIds,
                 totalNumberOfOwnedSubtasks,
-                prefixesToAbort,
+                unscopedPrefixes,
+                attemptScopedPrefix,
+                prefixesOfEarlierAttempts,
+                restoredAttemptScopedPrefixes,
                 startCheckpointId,
-                aborter,
+                this::abortTransaction,
                 this::getOrCreateAdminClient,
-                precommittedTransactionalIds);
+                recoveredTransactionalIds);
+    }
+
+    /**
+     * Aborts the transaction that is open under the given id, if any.
+     *
+     * @return the epoch of the producer after the abort; 0 if the id was unused before
+     */
+    private short abortTransaction(String transactionalId) {
+        // getTransactionalProducer already calls initTransactions, which cancels the transaction
+        FlinkKafkaInternalProducer<byte[], byte[]> producer =
+                producerPool.getTransactionalProducer(transactionalId, 0);
+        LOG.debug("Aborting transaction {}", transactionalId);
+        producer.flush();
+        short epoch = producer.getEpoch();
+        producerPool.recycle(producer);
+        return epoch;
     }
 
     private Collection<String> getTopicNames() {

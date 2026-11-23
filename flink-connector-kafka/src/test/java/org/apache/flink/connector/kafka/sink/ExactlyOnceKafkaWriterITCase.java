@@ -40,6 +40,7 @@ import org.apache.flink.util.ExceptionUtils;
 import com.google.common.collect.Iterables;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.TransactionListing;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.errors.InterruptException;
@@ -60,7 +61,9 @@ import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
+import static org.apache.flink.connector.kafka.sink.internal.TransactionalIdFactory.buildAttemptScopedPrefix;
 import static org.apache.flink.connector.kafka.sink.internal.TransactionalIdFactory.buildTransactionalId;
+import static org.apache.flink.connector.kafka.sink.internal.TransactionalIdFactory.extractPrefix;
 import static org.apache.flink.connector.kafka.testutils.KafkaUtil.drainAllRecordsFromTopic;
 import static org.apache.flink.connector.kafka.testutils.KafkaUtil.waitUntilNoTransactionIsOpen;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -226,10 +229,10 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
             onCheckpointBarrier(failedWriter, 1);
             onCheckpointBarrier(failedWriter, 2);
 
-            // use state to ensure that the new writer knows about the old prefix
+            // use state to ensure that the new writer knows about the prefix of the old attempt
             KafkaWriterState state =
                     new KafkaWriterState(
-                            failedWriter.getTransactionalIdPrefix(),
+                            attemptScopedPrefix(failedWriter),
                             0,
                             1,
                             TransactionOwnership.IMPLICIT_BY_SUBTASK_ID,
@@ -291,9 +294,6 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
      * Tests that a writer of an earlier attempt does not end the transaction that the writer of a
      * later attempt of the same subtask has pre-committed, when the earlier writer is created only
      * after the pre-commit. The earlier writer may start or refuse to start; the test accepts both.
-     *
-     * <p>KNOWN, OPEN DEFECT: this test is expected to fail until writers of different attempts of a
-     * subtask can no longer end each other's transactions.
      */
     @ParameterizedTest
     @EnumSource(TransactionNamingStrategy.class)
@@ -348,11 +348,154 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
             waitUntilNoTransactionIsOpen(topic, getKafkaClientConfiguration());
             assertThat(drainAllRecordsFromTopic(topic, getKafkaClientConfiguration(), true))
                     .as(
-                            "KNOWN, OPEN DEFECT - this failure is expected until it is fixed: "
-                                    + "the writer of the earlier attempt ended the transaction "
-                                    + "that the later attempt had pre-committed, so the record "
-                                    + "of the later attempt is not committed")
+                            "committed records; without the record, the writer of the earlier "
+                                    + "attempt ended the transaction that the later attempt had "
+                                    + "pre-committed")
                     .hasSize(1);
+        }
+    }
+
+    /**
+     * Tests that a writer names its transactions and its state after its execution attempt, so that
+     * no other attempt of the subtask uses the same transactional ids.
+     */
+    @ParameterizedTest
+    @EnumSource(TransactionNamingStrategy.class)
+    void shouldScopeTransactionalIdsToAttempt(TransactionNamingStrategy namingStrategy)
+            throws Exception {
+        final String prefix = getTransactionalPrefix();
+        final int attempt = 3;
+        final long restoredCheckpointId = 7;
+        final SinkInitContext initContext = createInitContext(attempt);
+        initContext.setRestoredCheckpointId(restoredCheckpointId);
+
+        try (final ExactlyOnceKafkaWriter<Integer> writer =
+                createWriter(exactlyOnce(namingStrategy, prefix), initContext)) {
+            final String scopedPrefix =
+                    buildAttemptScopedPrefix(prefix, restoredCheckpointId, 0, attempt);
+            assertThat(extractPrefix(writer.getCurrentProducer().getTransactionalId()))
+                    .isEqualTo(scopedPrefix);
+
+            final Tuple2<KafkaWriterState, KafkaCommittable> checkpoint =
+                    onCheckpointBarrier(writer, (int) restoredCheckpointId + 1);
+            assertThat(extractPrefix(checkpoint.f1.getTransactionalId())).isEqualTo(scopedPrefix);
+            // the writer that restores the state finds the transactions of this attempt with it
+            assertThat(checkpoint.f0.getTransactionalIdPrefix()).isEqualTo(scopedPrefix);
+            assertThat(extractPrefix(writer.getCurrentProducer().getTransactionalId()))
+                    .isEqualTo(scopedPrefix);
+        }
+    }
+
+    /**
+     * Tests that a writer aborts the transaction that an earlier attempt of its subtask has left
+     * open, when both attempts started from the same point and no state tells of the earlier one.
+     */
+    @ParameterizedTest
+    @EnumSource(TransactionNamingStrategy.class)
+    void shouldAbortTransactionsOfEarlierAttempt(TransactionNamingStrategy namingStrategy)
+            throws Exception {
+        final Consumer<KafkaSinkBuilder<?>> sink =
+                exactlyOnce(namingStrategy, getTransactionalPrefix());
+
+        try (final ExactlyOnceKafkaWriter<Integer> earlierWriter =
+                createWriter(sink, createInitContext(0))) {
+            // the checkpoint does not complete, so the transaction stays open
+            onCheckpointBarrier(earlierWriter, 1);
+        }
+        try (AdminClient admin = AdminClient.create(getKafkaClientConfiguration())) {
+            assertThat(AdminUtils.getOpenTransactionsForTopics(admin, Collections.singleton(topic)))
+                    .hasSize(1);
+        }
+
+        try (final ExactlyOnceKafkaWriter<Integer> laterWriter =
+                createWriter(sink, createInitContext(1))) {
+            waitUntilNoTransactionIsOpen(topic, getKafkaClientConfiguration());
+            assertThat(drainAllRecordsFromTopic(topic, getKafkaClientConfiguration(), true))
+                    .isEmpty();
+        }
+    }
+
+    /**
+     * Tests that a writer aborts the transactions of a recovered state that was written before
+     * transactional ids were scoped to an attempt. Such a state holds the prefix of the sink, and
+     * its transactions are named {@code prefix-subtask-offset}.
+     */
+    @ParameterizedTest
+    @EnumSource(TransactionNamingStrategy.class)
+    void shouldAbortTransactionsOfPrefixWithoutAttemptScope(
+            TransactionNamingStrategy namingStrategy) throws Exception {
+        final String prefix = getTransactionalPrefix();
+        try (FlinkKafkaInternalProducer<byte[], byte[]> producer =
+                new FlinkKafkaInternalProducer<>(
+                        getKafkaClientConfiguration(), buildTransactionalId(prefix, 0, 1))) {
+            producer.initTransactions();
+            producer.beginTransaction();
+            producer.send(new ProducerRecord<>(topic, "1".getBytes()));
+            producer.flush();
+            // closing the producer leaves the transaction open
+        }
+        final KafkaWriterState state =
+                new KafkaWriterState(
+                        prefix,
+                        0,
+                        1,
+                        namingStrategy == TransactionNamingStrategy.POOLING
+                                ? TransactionOwnership.EXPLICIT_BY_WRITER_STATE
+                                : TransactionOwnership.IMPLICIT_BY_SUBTASK_ID,
+                        List.of());
+
+        try (final ExactlyOnceKafkaWriter<Integer> writer =
+                restoreWriter(
+                        exactlyOnce(namingStrategy, prefix), List.of(state), createInitContext())) {
+            waitUntilNoTransactionIsOpen(topic, getKafkaClientConfiguration());
+            assertThat(drainAllRecordsFromTopic(topic, getKafkaClientConfiguration(), true))
+                    .isEmpty();
+        }
+    }
+
+    /**
+     * Tests that a restored writer aborts the transaction under the id of a recovered transaction
+     * once the committer reports that it could not commit that transaction. With pooled ids, the
+     * attempt that wrote the state may have used the id again for a transaction that no checkpoint
+     * covers. The cleanup at the start of the writer spares the id for the committer.
+     */
+    @Test
+    void shouldAbortIdOfRecoveredTransactionAfterFailedCommit() throws Exception {
+        final String prefix = getTransactionalPrefix();
+        final String prefixOfEarlierAttempt = buildAttemptScopedPrefix(prefix, 0, 0, 0);
+        final String reusedId = buildTransactionalId(prefixOfEarlierAttempt, 0, 0);
+        try (FlinkKafkaInternalProducer<byte[], byte[]> producer =
+                new FlinkKafkaInternalProducer<>(getKafkaClientConfiguration(), reusedId)) {
+            producer.initTransactions();
+            producer.beginTransaction();
+            producer.send(new ProducerRecord<>(topic, "1".getBytes()));
+            producer.flush();
+            // closing the producer leaves the transaction open
+        }
+        final KafkaWriterState state =
+                new KafkaWriterState(
+                        prefixOfEarlierAttempt,
+                        0,
+                        1,
+                        TransactionOwnership.EXPLICIT_BY_WRITER_STATE,
+                        List.of(new CheckpointTransaction(reusedId, 1)));
+        final SinkInitContext initContext = createInitContext();
+        initContext.setRestoredCheckpointId(1);
+
+        try (final ExactlyOnceKafkaWriter<Integer> writer =
+                        restoreWriter(this::withPooling, List.of(state), initContext);
+                WritableBackchannel<TransactionFinished> backchannel = getBackchannel(writer);
+                AdminClient admin = AdminClient.create(getKafkaClientConfiguration())) {
+            assertThat(AdminUtils.getOpenTransactionsForTopics(admin, Collections.singleton(topic)))
+                    .extracting(TransactionListing::transactionalId)
+                    .containsExactly(reusedId);
+
+            backchannel.send(TransactionFinished.erroneously(reusedId));
+            writer.snapshotState(2);
+
+            waitUntilNoTransactionIsOpen(topic, getKafkaClientConfiguration());
+            assertThat(drainAllRecordsFromTopic(topic, getKafkaClientConfiguration(), true))
+                    .isEmpty();
         }
     }
 
@@ -495,15 +638,22 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
                 .isNull();
     }
 
-    /** Test that producers are reused when committed. */
+    /**
+     * Test that a pooled id is skipped while its transaction is ongoing and used again when the
+     * committer has finished the transaction. The transactions of the recovered state have the
+     * prefix of the attempt that wrote them, so they do not take ids from the restored writer.
+     */
     @Test
-    void shouldSkipIdsOfCommitterForPooledTransactions() throws Exception {
+    void shouldSkipIdsOfOngoingPooledTransactions() throws Exception {
         String prefix = getTransactionalPrefix();
-        CheckpointTransaction t1 = new CheckpointTransaction(buildTransactionalId(prefix, 0, 2), 2);
-        CheckpointTransaction t2 = new CheckpointTransaction(buildTransactionalId(prefix, 0, 4), 4);
+        String prefixOfEarlierAttempt = buildAttemptScopedPrefix(prefix, 1, 0, 0);
+        CheckpointTransaction t1 =
+                new CheckpointTransaction(buildTransactionalId(prefixOfEarlierAttempt, 0, 0), 2);
+        CheckpointTransaction t2 =
+                new CheckpointTransaction(buildTransactionalId(prefixOfEarlierAttempt, 0, 1), 4);
         final KafkaWriterState writerState =
                 new KafkaWriterState(
-                        prefix,
+                        prefixOfEarlierAttempt,
                         0,
                         1,
                         TransactionOwnership.EXPLICIT_BY_WRITER_STATE,
@@ -518,29 +668,31 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
                                 Collections.singletonList(writerState),
                                 initContext);
                 WritableBackchannel<TransactionFinished> backchannel = getBackchannel(writer)) {
-            // offsets leave out the used 2 and 4
-            for (int expectedOffset : new int[] {0, 1, 3, 5, 6}) {
+            String ownPrefix = attemptScopedPrefix(writer);
+            assertThat(ownPrefix).isNotEqualTo(prefixOfEarlierAttempt);
+            // no transaction is finished, so every checkpoint takes the next offset
+            for (int expectedOffset : new int[] {0, 1, 2}) {
                 assertThat(writer.getCurrentProducer().getTransactionalId())
-                        .isEqualTo(buildTransactionalId(prefix, 0, expectedOffset));
+                        .isEqualTo(buildTransactionalId(ownPrefix, 0, expectedOffset));
                 writer.write(checkpointId, SINK_WRITER_CONTEXT);
                 writer.flush(false);
                 writer.prepareCommit();
                 writer.snapshotState(++checkpointId);
             }
 
-            // free 4, which also frees 2; 2 is returned first and then 4
-            backchannel.send(new TransactionFinished(t2.getTransactionalId(), true));
+            // free 1, which also frees 0 and the recovered transactions; 0 is returned first
+            backchannel.send(new TransactionFinished(buildTransactionalId(ownPrefix, 0, 1), true));
             writer.write(checkpointId, SINK_WRITER_CONTEXT);
             writer.prepareCommit();
             writer.snapshotState(++checkpointId);
             assertThat(writer.getCurrentProducer().getTransactionalId())
-                    .isEqualTo(t1.getTransactionalId());
+                    .isEqualTo(buildTransactionalId(ownPrefix, 0, 0));
 
             writer.write(checkpointId, SINK_WRITER_CONTEXT);
             writer.prepareCommit();
             writer.snapshotState(++checkpointId);
             assertThat(writer.getCurrentProducer().getTransactionalId())
-                    .isEqualTo(t2.getTransactionalId());
+                    .isEqualTo(buildTransactionalId(ownPrefix, 0, 1));
         }
     }
 
@@ -551,6 +703,19 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
                         builder.setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
                                 .setTransactionNamingStrategy(namingStrategy),
                 createInitContext());
+    }
+
+    /** The prefix under which the attempt of the writer names its transactions. */
+    private static String attemptScopedPrefix(KafkaWriter<?> writer) {
+        return extractPrefix(writer.getCurrentProducer().getTransactionalId());
+    }
+
+    private static Consumer<KafkaSinkBuilder<?>> exactlyOnce(
+            TransactionNamingStrategy namingStrategy, String transactionalIdPrefix) {
+        return builder ->
+                builder.setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+                        .setTransactionNamingStrategy(namingStrategy)
+                        .setTransactionalIdPrefix(transactionalIdPrefix);
     }
 
     private SinkInitContext createInitContext(int attemptNumber) {

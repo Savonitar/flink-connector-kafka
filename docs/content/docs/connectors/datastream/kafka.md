@@ -677,6 +677,48 @@ an explanation of the different guarantees.
   transaction.timeout.ms)>> maximum checkpoint duration + maximum restart duration or data loss may
   happen when Kafka expires an uncommitted transaction. 
 
+#### Transactional ids
+
+With `DeliveryGuarantee.EXACTLY_ONCE` the sink names its Kafka transactions
+`transactionalIdPrefix-checkpoint_subtask_attempt-subtask-offset`. The second part is the scope of one
+execution attempt of the sink writer: the id of the checkpoint that the attempt started from (`0` if it
+started without one), the index of its subtask and its attempt number. The last part depends on the
+`TransactionNamingStrategy`.
+
+Kafka lets a producer end the transaction that another producer has open under the same
+`transactional.id`. Two execution attempts of a subtask can run at the same time for a while, for
+example when a TaskManager has lost its connection to the JobManager and has not stopped its tasks yet.
+Every attempt has transactional ids of its own, so a writer of an earlier attempt that is still running
+cannot end a transaction of a later attempt.
+
+When a writer starts, it aborts the transactions that an execution before it has left open, so that
+consumers with `isolation.level=read_committed` are not held up by them. It aborts the transactions of
+
+- the attempt that wrote the checkpoint or savepoint it starts from,
+- the earlier attempts of its subtask that started from the same checkpoint or, like itself, without
+  one, and
+- an attempt with the same scope as itself, which only an earlier run of the job or a previous
+  JobManager can have started.
+
+The writer leaves all other transactions alone, because it cannot tell an execution that has ended
+from a later attempt that is running. The broker aborts them when they reach `transaction.timeout.ms`,
+and consumers with `isolation.level=read_committed` do not get past them until then. Examples are the
+transactions of
+
+- an earlier run of the job, if the job is started without a checkpoint or savepoint,
+- attempts of an earlier run that started from the checkpoint the job is started from, or from a later
+  one,
+- subtasks that no longer exist after the job was rescaled before its first checkpoint completed,
+- attempts that a previous JobManager started from the same checkpoint, if a JobManager takes over the
+  job, for example after a JobManager failover. Attempts are numbered from 0 again then, so the
+  attempts of the new JobManager cannot tell which of these came before them.
+
+After such a takeover, an attempt of the previous JobManager and an attempt of the new one have the
+same transactional ids if they started from the same checkpoint with the same attempt number. If the
+earlier one is still running, the two can end each other's transactions; see
+[Aborted transactions](#aborted-transactions-with-deliveryguaranteeexactly_once) for what the sink does
+then.
+
 ### Monitoring
 
 Kafka sink exposes the following metrics in the respective [scope]({{< ref "docs/ops/metrics" >}}/#scope).
@@ -800,11 +842,10 @@ if the broker aborts the transaction before this commit. The broker does so in t
   checkpoint, several failed checkpoints in a row, or the restart of the job after a failure took that
   long. A transaction is committed only when a checkpoint completes, so it stays open during the failed
   checkpoints before that one.
-- Another producer has been initialized with the same `transactional.id`. The ids of the sink have the
-  form `transactionalIdPrefix-subtask-offset`. Another sink with the same `transactionalIdPrefix` on the
-  same Kafka cluster therefore uses the same ids, and so does another execution attempt of the same
-  subtask. Two attempts of a subtask can run at the same time for a while, for example when a TaskManager
-  has lost its connection to the JobManager and has not stopped its tasks yet.
+- Another producer has been initialized with the same `transactional.id`. The ids of the sink start
+  with the `transactionalIdPrefix`, see [Transactional ids](#transactional-ids). Another sink with the
+  same `transactionalIdPrefix` on the same Kafka cluster can therefore use the same ids, and so can an
+  attempt that a previous JobManager started for the same subtask.
 
 The commit of the aborted transaction fails with a `ProducerFencedException` or an
 `InvalidTxnStateException`. What the sink does then depends on the transaction:

@@ -195,7 +195,11 @@ class KafkaSinkRecoveryITCase {
                     .as("C3 reused C1's transactional id before recovery")
                     .contains(
                             TransactionalIdFactory.buildTransactionalId(
-                                    transactionalIdPrefix, 0, 0));
+                                    // subtask 0 started without a checkpoint and runs attempt 0
+                                    TransactionalIdFactory.buildAttemptScopedPrefix(
+                                            transactionalIdPrefix, 0L, 0, 0),
+                                    0,
+                                    0));
         }
 
         cancelAndWait(original, originalControls.get());

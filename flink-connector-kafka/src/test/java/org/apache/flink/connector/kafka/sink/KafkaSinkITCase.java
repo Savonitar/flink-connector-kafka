@@ -475,6 +475,12 @@ class KafkaSinkITCase {
         assertThat(committedRecords).containsExactlyInAnyOrderElementsOf(checkpointedRecords.get());
     }
 
+    /**
+     * Tests that the transactions of a job that failed before its first checkpoint do not hold up
+     * the output of the next job when that job runs with a lower parallelism. No state tells the
+     * writer of the next job of the subtasks that are gone, and a writer does not guess the
+     * transactional ids of other subtasks. Their transactions end when they time out.
+     */
     @ParameterizedTest(name = "{0}, chained={1}")
     @MethodSource("getEOSParameters")
     public void testAbortTransactionsAfterScaleInBeforeFirstCheckpoint(
@@ -494,6 +500,7 @@ class KafkaSinkITCase {
                     namingStrategy,
                     chained,
                     null,
+                    Duration.ofSeconds(5),
                     clusterClient);
         } catch (Exception e) {
             assertThat(e.getCause().getCause().getMessage())
@@ -501,7 +508,8 @@ class KafkaSinkITCase {
         }
         assertThat(deserializeValues(drainAllRecordsFromTopic(topic, true))).isEmpty();
 
-        // Second job aborts all transactions from previous runs with higher parallelism
+        // The second job has one subtask. Its writer aborts the transaction of the first attempt
+        // of that subtask in the first job, which had the same transactional ids.
         SharedReference<AtomicBoolean> failed = sharedObjects.add(new AtomicBoolean(true));
         SharedReference<Set<Long>> checkpointedRecords =
                 sharedObjects.add(new ConcurrentSkipListSet<>());
@@ -514,6 +522,8 @@ class KafkaSinkITCase {
                 chained,
                 null,
                 clusterClient);
+        // the broker aborts the transactions of the other four subtasks after their timeout
+        KafkaUtil.waitUntilNoTransactionIsOpen(topic, getKafkaClientConfiguration());
         final List<Long> committedRecords =
                 deserializeValues(drainAllRecordsFromTopic(topic, true));
         assertThat(committedRecords).containsExactlyInAnyOrderElementsOf(checkpointedRecords.get());
@@ -722,6 +732,27 @@ class KafkaSinkITCase {
             @Nullable String transactionalIdPrefix,
             ClusterClient<?> clusterClient)
             throws Exception {
+        return executeWithMapper(
+                mapper,
+                checkpointedRecords,
+                config,
+                namingStrategy,
+                chained,
+                transactionalIdPrefix,
+                null,
+                clusterClient);
+    }
+
+    private JobID executeWithMapper(
+            MapFunction<Long, Long> mapper,
+            SharedReference<Set<Long>> checkpointedRecords,
+            Configuration config,
+            TransactionNamingStrategy namingStrategy,
+            boolean chained,
+            @Nullable String transactionalIdPrefix,
+            @Nullable Duration transactionTimeout,
+            ClusterClient<?> clusterClient)
+            throws Exception {
 
         config.set(RestartStrategyOptions.RESTART_STRATEGY, "disable");
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(config);
@@ -746,6 +777,11 @@ class KafkaSinkITCase {
             transactionalIdPrefix = "kafka-sink";
         }
         builder.setTransactionalIdPrefix(transactionalIdPrefix);
+        if (transactionTimeout != null) {
+            builder.setProperty(
+                    ProducerConfig.TRANSACTION_TIMEOUT_CONFIG,
+                    String.valueOf(transactionTimeout.toMillis()));
+        }
         stream.sinkTo(builder.build());
         final JobGraph jobGraph = env.getStreamGraph().getJobGraph();
         JobID jobID = clusterClient.submitJob(jobGraph).get();

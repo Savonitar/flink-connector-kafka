@@ -34,9 +34,10 @@ import static org.apache.flink.util.Preconditions.checkState;
  * <p>A subtask that owns a transactional id is responsible for committing and aborting the
  * transactions having that id. Only that subtask may create new ids.
  *
- * <p>Transactional ids have the form <code>transactionalIdPrefix + "-" + subtaskId + "-" + counter
- * </code>. The prefix is given by the user, the subtask id is defined through the ownership model
- * and the counter through the {@link
+ * <p>Transactional ids have the form <code>prefix + "-" + subtaskId + "-" + counter
+ * </code>. The prefix is the prefix given by the user followed by the scope of the execution
+ * attempt, see {@link TransactionalIdFactory#buildAttemptScopedPrefix(String, long, int, int)}. The
+ * subtask id is defined through the ownership model and the counter through the {@link
  * org.apache.flink.connector.kafka.sink.TransactionNamingStrategy}.
  *
  * <p>For all strategies ownership is extrapolated for subtask ids beyond the currently known

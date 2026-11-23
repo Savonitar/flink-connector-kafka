@@ -583,6 +583,37 @@ KafkaRecordSerializationSchema.builder() \
   完成时才会可见，因此请按需调整 checkpoint 的间隔。请确认事务 ID 的前缀（transactionIdPrefix）对不同的应用是唯一的，以保证不同作业的事务
   不会互相影响！此外，强烈建议将 Kafka 的事务超时时间调整至远大于 checkpoint 最大间隔 + 最大重启时间，否则 Kafka 对未提交事务的过期处理会导致数据丢失。
 
+<a name="transactional-ids"></a>
+
+#### 事务 ID
+
+使用 `DeliveryGuarantee.EXACTLY_ONCE` 时，sink 的 Kafka 事务 ID 格式为
+`transactionalIdPrefix-checkpoint_subtask_attempt-subtask-offset`。第二部分是 sink writer 的一次执行尝试（execution attempt）的作用域：
+该执行尝试启动时所恢复的 checkpoint 的 ID（没有从 checkpoint 启动时为 `0`）、subtask 的下标以及执行尝试的编号（attempt number）。
+最后一部分取决于 `TransactionNamingStrategy`。
+
+在 Kafka 中，一个 producer 可以结束另一个 producer 用相同的 `transactional.id` 打开的事务。同一个 subtask 的两次执行尝试有可能在一段时间内同时运行，
+例如 TaskManager 与 JobManager 失去连接、但尚未停止其上的 task 时。每次执行尝试都使用自己的事务 ID，
+因此仍在运行的较早的执行尝试的 writer 无法结束较晚的执行尝试的事务。
+
+writer 启动时会中止之前的执行遗留的未结束的事务，使 `isolation.level=read_committed` 的 consumer 不会被这些事务阻塞。它会中止以下执行尝试的事务：
+
+- 写入了它所恢复的 checkpoint 或 savepoint 的执行尝试；
+- 同一个 subtask 的、从同一个 checkpoint 启动（或者和它一样没有从 checkpoint 启动）的较早的执行尝试；
+- 与它自己作用域相同的执行尝试，这只可能是作业的上一次运行或者上一个 JobManager 启动的执行尝试。
+
+writer 不会处理其他事务，因为它无法区分已经结束的执行和正在运行的较晚的执行尝试。这些事务会在达到 `transaction.timeout.ms` 时被 broker 中止，
+在此之前 `isolation.level=read_committed` 的 consumer 无法越过它们。例如以下执行的事务：
+
+- 作业的上一次运行，如果作业启动时没有使用 checkpoint 或 savepoint；
+- 上一次运行中，从作业启动所使用的 checkpoint 或者更晚的 checkpoint 启动的执行尝试；
+- 作业在第一个 checkpoint 完成之前改变了并发度后不再存在的 subtask；
+- 当新的 JobManager 接管作业时（例如 JobManager 发生故障切换之后），上一个 JobManager 从同一个 checkpoint 启动的执行尝试。
+  此时执行尝试会重新从 0 开始编号，因此新的 JobManager 的执行尝试无法判断其中哪些早于自己。
+
+在这样的接管之后，如果上一个 JobManager 的某次执行尝试和新的 JobManager 的某次执行尝试从同一个 checkpoint 启动并且编号相同，
+它们会使用相同的事务 ID。如果较早的那个仍在运行，二者可能会结束对方的事务；此时 sink 的行为请参见[数据丢失](#data-loss)。
+
 ### 监控
 
 Kafka sink 会在不同的[范围（Scope）]({{< ref "docs/ops/metrics" >}}/#scope)中汇报下列指标。
@@ -683,9 +714,8 @@ Flink 通过 Kafka 连接器提供了一流的支持，可以对 Kerberos 配置
 
 - 事务处于打开状态的时间超过了 `transaction.timeout.ms`，例如某次 checkpoint、连续多次失败的 checkpoint 或者作业失败后的重启耗时过长。
   事务只有在 checkpoint 完成时才会被提交，因此在此之前的 checkpoint 失败期间它一直处于打开状态。
-- 另一个 producer 使用相同的 `transactional.id` 进行了初始化。sink 的事务 ID 格式为 `transactionalIdPrefix-subtask-offset`，
-  因此在同一个 Kafka 集群上使用相同 `transactionalIdPrefix` 的另一个 sink 会使用相同的 ID，同一个 subtask 的另一次执行尝试（execution attempt）也是如此。
-  同一个 subtask 的两次执行尝试有可能在一段时间内同时运行，例如 TaskManager 与 JobManager 失去连接、但尚未停止其上的 task 时。
+- 另一个 producer 使用相同的 `transactional.id` 进行了初始化。sink 的事务 ID 以 `transactionalIdPrefix` 开头，参见[事务 ID](#transactional-ids)。
+  因此在同一个 Kafka 集群上使用相同 `transactionalIdPrefix` 的另一个 sink 可能会使用相同的 ID，上一个 JobManager 为同一个 subtask 启动的执行尝试（execution attempt）也可能如此。
 
 此时提交被中止的事务会以 `ProducerFencedException` 或 `InvalidTxnStateException` 失败。sink 接下来的行为取决于这个事务：
 

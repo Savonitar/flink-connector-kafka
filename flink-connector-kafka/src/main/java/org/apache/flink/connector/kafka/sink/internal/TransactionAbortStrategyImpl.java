@@ -24,11 +24,26 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-/** Implementations of an abort strategy for transactions left over from previous runs. */
+/**
+ * Implementations of an abort strategy for transactions left over from previous runs.
+ *
+ * <p>A writer names its transactions under a prefix that is scoped to its execution attempt, see
+ * {@link TransactionalIdFactory#buildAttemptScopedPrefix(String, long, int, int)}. Both strategies
+ * abort transactions under the prefixes that the writer knows to belong to an execution that came
+ * before it: the prefixes in its recovered state and the prefixes of earlier attempts of its
+ * subtask that started from the same checkpoint. They also abort under the prefix of the writer
+ * itself, which only an attempt of an earlier run of the job or of a previous JobManager can have
+ * used. They never construct or match the prefix of a later attempt, so a writer that is created
+ * late cannot end a transaction that a later attempt has open. Transactions of other executions are
+ * left to the transaction timeout.
+ */
 @Internal
 public enum TransactionAbortStrategyImpl {
     /**
@@ -42,13 +57,32 @@ public enum TransactionAbortStrategyImpl {
      * policy that prevents tight restart loops (e.g. incremental backoff or hard failure after X
      * attempts).
      *
-     * <p>This is exactly the same behavior as in flink-connector-kafka 3.X.
+     * <p>Under a prefix without an attempt scope, this is exactly the same behavior as in
+     * flink-connector-kafka 3.X.
      */
     PROBING {
         @Override
         public void abortTransactions(Context context) {
             for (String prefix : context.getPrefixesToAbort()) {
                 abortTransactionsWithPrefix(prefix, context);
+            }
+
+            // Under an attempt-scoped prefix only the writer that the prefix belongs to has named
+            // transactions. The subtask ids are known, so there is nothing to extrapolate.
+            abortTransactionOfSubtask(
+                    context.getAttemptScopedPrefix(), context.getCurrentSubtaskId(), context);
+            for (Map.Entry<String, Set<Integer>> restored :
+                    context.getRestoredAttemptScopedPrefixes().entrySet()) {
+                for (int subtaskId : restored.getValue()) {
+                    abortTransactionOfSubtask(restored.getKey(), subtaskId, context);
+                }
+            }
+            for (String prefix : context.getPrefixesOfEarlierAttempts()) {
+                if (abortTransactionOfSubtask(prefix, context.getCurrentSubtaskId(), context) > 0) {
+                    // That attempt has opened its first transaction, which a writer does after it
+                    // has aborted the transactions of the attempts before it.
+                    break;
+                }
             }
         }
 
@@ -125,12 +159,13 @@ public enum TransactionAbortStrategyImpl {
                 return;
             }
 
+            Set<String> prefixesOfThisSubtask =
+                    new HashSet<>(context.getPrefixesOfEarlierAttempts());
+            prefixesOfThisSubtask.add(context.getAttemptScopedPrefix());
+
             List<String> openTransactionsForSubtask =
                     openTransactionsForTopics.stream()
-                            // ignore transactions from other applications
-                            .filter(name -> hasKnownPrefix(name, context))
-                            //  look only at transactions owned by this subtask
-                            .filter(context::ownsTransactionalId)
+                            .filter(name -> isAbortable(name, prefixesOfThisSubtask, context))
                             .collect(Collectors.toList());
 
             LOG.warn(
@@ -152,8 +187,27 @@ public enum TransactionAbortStrategyImpl {
             }
         }
 
-        private boolean hasKnownPrefix(String name, Context context) {
-            return context.getPrefixesToAbort().stream().anyMatch(name::startsWith);
+        /**
+         * A transaction can be aborted if its prefix is known to belong to an execution before this
+         * writer. The prefix has to match exactly: every attempt of every subtask has a prefix of
+         * its own, and they all start with the configured prefix.
+         */
+        private boolean isAbortable(
+                String name, Set<String> prefixesOfThisSubtask, Context context) {
+            // ignore transactions from other applications
+            Optional<String> prefix = TransactionalIdFactory.findPrefix(name);
+            if (prefix.isEmpty()) {
+                return false;
+            }
+            // transactions of this attempt and of earlier attempts of this subtask
+            if (prefixesOfThisSubtask.contains(prefix.get())) {
+                return true;
+            }
+            // The writers of the recovered state may have been redistributed over the subtasks,
+            // so look only at transactions owned by this subtask
+            return (context.getPrefixesToAbort().contains(prefix.get())
+                            || context.getRestoredAttemptScopedPrefixes().containsKey(prefix.get()))
+                    && context.ownsTransactionalId(name);
         }
     };
 
@@ -197,7 +251,27 @@ public enum TransactionAbortStrategyImpl {
          */
         boolean ownsTransactionalId(String transactionalId);
 
+        /**
+         * Returns the prefixes without an attempt scope: prefixes that the recovered state got from
+         * a version that did not scope transactional ids to an attempt. A subtask finds the
+         * transactions of such a prefix by its subtask id.
+         */
         Set<String> getPrefixesToAbort();
+
+        /** Returns the prefix under which this attempt of the writer names its transactions. */
+        String getAttemptScopedPrefix();
+
+        /**
+         * Returns the prefixes of the earlier attempts of this subtask that started from the same
+         * checkpoint as this attempt, the latest attempt first.
+         */
+        List<String> getPrefixesOfEarlierAttempts();
+
+        /**
+         * Returns the attempt-scoped prefixes of the recovered state, each with the ids of the
+         * subtasks that the state names for it.
+         */
+        Map<String, Set<Integer>> getRestoredAttemptScopedPrefixes();
 
         /**
          * Returns a list of transactional ids that shouldn't be aborted because they are part of
