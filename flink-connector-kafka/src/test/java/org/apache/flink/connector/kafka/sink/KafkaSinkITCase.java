@@ -69,6 +69,7 @@ import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.connectors.kafka.testutils.ClusterCommunicationUtils;
 import org.apache.flink.test.junit5.InjectClusterClient;
 import org.apache.flink.test.junit5.InjectMiniCluster;
 import org.apache.flink.test.junit5.MiniClusterExtension;
@@ -122,6 +123,7 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -350,9 +352,20 @@ class KafkaSinkITCase {
                                 .setTransactionalIdPrefix("kafka-sink-" + UUID.randomUUID())
                                 .setTransactionNamingStrategy(namingStrategy)
                                 .build());
-        final JobID jobId = clusterClient.submitJob(env.getStreamGraph().getJobGraph()).get();
+        final JobGraph jobGraph = env.getStreamGraph().getJobGraph();
+        final CompletableFuture<JobID> submission = clusterClient.submitJob(jobGraph);
 
-        try {
+        try (AutoCloseable jobCleanup =
+                () -> {
+                    gate.get().proceed.countDown();
+                    ClusterCommunicationUtils.cancelJobAfterSubmission(
+                            clusterClient,
+                            jobGraph.getJobID(),
+                            submission,
+                            Duration.ofSeconds(ABORTED_TRANSACTION_TEST_TIMEOUT_SECONDS));
+                }) {
+            final JobID jobId =
+                    submission.get(ABORTED_TRANSACTION_TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             assertThat(
                             gate.get()
                                     .precommitted
@@ -418,8 +431,6 @@ class KafkaSinkITCase {
                             "the failure does not bring the records of the aborted transaction"
                                     + " back; all other records are committed exactly once")
                     .containsExactlyInAnyOrderElementsOf(expectedRecords);
-        } finally {
-            gate.get().proceed.countDown();
         }
     }
 

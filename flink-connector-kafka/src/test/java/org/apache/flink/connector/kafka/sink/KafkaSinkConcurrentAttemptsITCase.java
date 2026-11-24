@@ -42,6 +42,7 @@ import org.apache.flink.connector.kafka.lineage.KafkaDatasetFacetProvider;
 import org.apache.flink.connector.kafka.testutils.KafkaUtil;
 import org.apache.flink.connector.kafka.testutils.TestKafkaContainer;
 import org.apache.flink.core.testutils.CommonTestUtils;
+import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.runtime.messages.webmonitor.ClusterOverview;
 import org.apache.flink.runtime.minicluster.MiniCluster;
@@ -50,6 +51,7 @@ import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.connectors.kafka.testutils.ClusterCommunicationUtils;
 import org.apache.flink.test.junit5.InjectClusterClient;
 import org.apache.flink.test.junit5.InjectMiniCluster;
 import org.apache.flink.test.junit5.MiniClusterExtension;
@@ -155,7 +157,7 @@ class KafkaSinkConcurrentAttemptsITCase {
     /**
      * Tests that every record of the source is committed exactly once when an earlier attempt of
      * the sink subtask initializes its writer while a later attempt waits for the completion of a
-     * checkpoint. The earlier writer may start or refuse to start; the test accepts both.
+     * checkpoint. The test requires the earlier writer to finish initialization.
      *
      * <p>KNOWN, OPEN DEFECT: this test is expected to fail until writers of different attempts of a
      * subtask can no longer end each other's transactions.
@@ -190,14 +192,16 @@ class KafkaSinkConcurrentAttemptsITCase {
                 sharedObjects.add(new PipelineControls(attemptsRestoreCheckpoint ? 1 : 0));
         cleanupActions.add(0, controls.get()::releaseAll);
 
-        final JobID jobId =
-                clusterClient
-                        .submitJob(
-                                createJob(topic, namingStrategy, controls)
-                                        .getStreamGraph()
-                                        .getJobGraph())
-                        .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-        cleanupActions.add(0, () -> cancelIfRunning(clusterClient, jobId));
+        final JobGraph jobGraph =
+                createJob(topic, namingStrategy, controls).getStreamGraph().getJobGraph();
+        final CompletableFuture<JobID> submission = clusterClient.submitJob(jobGraph);
+        // Release the blocked TaskManager and tasks before waiting for cancellation.
+        cleanupActions.add(
+                1,
+                () ->
+                        ClusterCommunicationUtils.cancelJobAfterSubmission(
+                                clusterClient, jobGraph.getJobID(), submission, TIMEOUT));
+        final JobID jobId = submission.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
 
         await(
                 controls.get().slowAttemptAtWriterOrEnded,
@@ -218,14 +222,14 @@ class KafkaSinkConcurrentAttemptsITCase {
                 controls.get().laterAttemptPrecommitted,
                 "a later attempt pre-committed records for a checkpoint");
         controls.get().releaseSlowAttempt.countDown();
-        // the later attempt keeps its checkpoint open until the slow attempt is past this point
+        // the later attempt keeps its checkpoint open while the slow attempt initializes its writer
         await(
-                controls.get().slowAttemptPastWriterInitialization,
-                "the slow attempt initialized its sink writer or failed to do so");
-        assertThat(controls.get().slowAttemptStartedWriterInitialization)
+                controls.get().slowAttemptInitializedWriterOrEnded,
+                "the slow attempt initialized its sink writer or ended");
+        assertThat(controls.get().slowAttemptInitializedWriter)
                 .as(
-                        "Precondition not met: the slow attempt ended in the constructor of "
-                                + "its sink writer, before the writer was initialized")
+                        "Precondition not met: the slow attempt ended before successfully "
+                                + "initializing its sink writer")
                 .isTrue();
 
         final JobResult jobResult =
@@ -323,17 +327,6 @@ class KafkaSinkConcurrentAttemptsITCase {
                 .isTrue();
     }
 
-    private static void cancelIfRunning(ClusterClient<?> clusterClient, JobID jobId)
-            throws Exception {
-        if (!clusterClient
-                .getJobStatus(jobId)
-                .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
-                .isGloballyTerminalState()) {
-            clusterClient.cancel(jobId).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-            clusterClient.requestJobResult(jobId).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-        }
-    }
-
     private static Properties kafkaProperties() {
         final Properties properties = new Properties();
         properties.put("bootstrap.servers", KAFKA.getBootstrapServers());
@@ -367,10 +360,10 @@ class KafkaSinkConcurrentAttemptsITCase {
 
         private volatile Thread slowAttemptThread;
         private volatile boolean slowAttemptReachedWriter;
-        private volatile boolean slowAttemptStartedWriterInitialization;
+        private volatile boolean slowAttemptInitializedWriter;
         private final CountDownLatch slowAttemptAtWriterOrEnded = new CountDownLatch(1);
         private final CountDownLatch releaseSlowAttempt = new CountDownLatch(1);
-        private final CountDownLatch slowAttemptPastWriterInitialization = new CountDownLatch(1);
+        private final CountDownLatch slowAttemptInitializedWriterOrEnded = new CountDownLatch(1);
         private final CountDownLatch endSlowAttempt = new CountDownLatch(1);
         private final CountDownLatch slowAttemptEnded = new CountDownLatch(1);
 
@@ -400,7 +393,6 @@ class KafkaSinkConcurrentAttemptsITCase {
             slowAttemptAtWriterOrEnded.countDown();
             // an interrupt means that the attempt was cancelled and will not initialize its writer
             releaseSlowAttempt.await();
-            slowAttemptStartedWriterInitialization = true;
         }
 
         private void stallTaskManagerOfSlowAttempt() {
@@ -460,7 +452,7 @@ class KafkaSinkConcurrentAttemptsITCase {
 
         private void releaseAll() {
             releaseSlowAttempt.countDown();
-            slowAttemptPastWriterInitialization.countDown();
+            slowAttemptInitializedWriterOrEnded.countDown();
             endSlowAttempt.countDown();
             releaseTaskManager.countDown();
         }
@@ -525,8 +517,10 @@ class KafkaSinkConcurrentAttemptsITCase {
         public void open(OpenContext openContext) throws Exception {
             if (isSlowAttempt()) {
                 // the sink writer of this attempt is initialized, the source has not started
-                controls.get().slowAttemptPastWriterInitialization.countDown();
-                controls.get().endSlowAttempt.await();
+                final PipelineControls pipeline = controls.get();
+                pipeline.slowAttemptInitializedWriter = true;
+                pipeline.slowAttemptInitializedWriterOrEnded.countDown();
+                pipeline.endSlowAttempt.await();
                 throw new IllegalStateException("The slow attempt ends without writing a record");
             }
         }
@@ -537,7 +531,7 @@ class KafkaSinkConcurrentAttemptsITCase {
                 // The attempt ends: before it reached its sink writer, in the initialization of
                 // the writer, or at the end of the test. The test tells these apart.
                 controls.get().slowAttemptAtWriterOrEnded.countDown();
-                controls.get().slowAttemptPastWriterInitialization.countDown();
+                controls.get().slowAttemptInitializedWriterOrEnded.countDown();
                 controls.get().slowAttemptEnded.countDown();
             }
         }
@@ -567,7 +561,7 @@ class KafkaSinkConcurrentAttemptsITCase {
                     pipeline.precommittedCheckpointId = checkpointId;
                     pipeline.laterAttemptPrecommitted.countDown();
                     // the checkpoint cannot complete before this method returns
-                    pipeline.slowAttemptPastWriterInitialization.await();
+                    pipeline.slowAttemptInitializedWriterOrEnded.await();
                 }
                 // The transactions with the records of this attempt are committed, the committer
                 // has told the writer, and no record was written since. So the writer state of

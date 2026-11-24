@@ -792,14 +792,15 @@ Please refer to the Kafka documentation for more explanation.
 
 #### Aborted transactions with `DeliveryGuarantee.EXACTLY_ONCE`
 
-With `DeliveryGuarantee.EXACTLY_ONCE` the `KafkaSink` writes the records between two checkpoints in one
-Kafka transaction and commits that transaction after the checkpoint has completed. The records are lost
-if the broker aborts the transaction before this commit. The broker does so in two cases:
+In checkpointed streaming with `DeliveryGuarantee.EXACTLY_ONCE`, each `KafkaSink` writer subtask
+writes the records it receives between checkpoint barriers to its own Kafka transaction. The committer
+commits that transaction after a checkpoint covering those records completes. The broker can abort an
+open transaction in the following cases.
 
-- The transaction has been open for longer than `transaction.timeout.ms`, for example because a
-  checkpoint, several failed checkpoints in a row, or the restart of the job after a failure took that
-  long. A transaction is committed only when a checkpoint completes, so it stays open during the failed
-  checkpoints before that one.
+- The transaction has been open for longer than `transaction.timeout.ms`. In checkpointed streaming,
+  a slow checkpoint, consecutive failed checkpoints, or a long restart can delay the commit past the
+  timeout. In batch execution, the timeout can elapse while the writer processes its input or while
+  the committer waits to run.
 - Another producer has been initialized with the same `transactional.id`. The ids of the sink have the
   form `transactionalIdPrefix-subtask-offset`. Another sink with the same `transactionalIdPrefix` on the
   same Kafka cluster therefore uses the same ids, and so does another execution attempt of the same
@@ -812,19 +813,22 @@ The commit of the aborted transaction fails with a `ProducerFencedException` or 
 - The task has written the transaction itself since it was last started, and the writer and the committer of
   the sink run in the same task: the task fails. The cause of the failure reads
   `Unable to commit transaction '<transactional.id>' because the broker rejected the commit` and says
-  that the records are lost unless another producer has committed the transaction. After the restart
-  the sink tries the commit once more from the restored checkpoint. It is rejected again, but now it is
-  only logged, so the same transaction does not fail the task a second time.
+  that the records are lost unless another producer has committed the transaction. If the job restarts
+  from a checkpoint containing that transaction, the sink retries the commit. If the broker rejects it
+  again with either exception, the sink logs the error and continues.
 - The transaction has been restored from a checkpoint or savepoint, or the committer does not run in
   the task of the writer: the sink logs a message that starts with `Unable to commit transaction`, and
   the job goes on.
 
 In streaming execution the writer and the committer run in the same task unless operator chaining is
-disabled for them. In batch execution the committer always runs in a task of its own.
+disabled for them. In batch execution the committer runs in a separate task and commits the
+transactions when it reaches the end of its input.
 
-In both cases the records of the aborted transaction are lost. Failing the task does not bring them
-back: the checkpoint that covers them is complete, so the restarted job continues after them and does
-not write them again. The failure only makes sure that the loss does not go unnoticed.
+In checkpointed streaming, if a write or flush fails before a checkpoint covering the records
+completes, Flink can restore the preceding checkpoint and replay the records. If the commit is
+rejected after the covering checkpoint completes, automatic recovery from that checkpoint or a later
+one resumes past those records. The records of the aborted transaction remain missing from the
+committed Kafka output.
 
 Where the task fails for an aborted transaction, that is with the writer and the committer in one task,
 it fails again for every further transaction that is aborted like this. If the cause persists, that

@@ -678,11 +678,12 @@ Flink 通过 Kafka 连接器提供了一流的支持，可以对 Kerberos 配置
 
 #### 使用 `DeliveryGuarantee.EXACTLY_ONCE` 时事务被中止
 
-使用 `DeliveryGuarantee.EXACTLY_ONCE` 时，`KafkaSink` 会把两次 checkpoint 之间的数据写入同一个 Kafka 事务，并在该 checkpoint 完成之后提交这个事务。
-如果 broker 在提交之前中止了这个事务，其中的数据就会丢失。broker 在以下两种情况下会中止事务：
+在启用 checkpoint 的流作业中使用 `DeliveryGuarantee.EXACTLY_ONCE` 时，每个 `KafkaSink` writer subtask 都会将自己在两次 checkpoint barrier 之间收到的记录写入各自的 Kafka 事务。
+包含这些记录的 checkpoint 完成后，committer 会提交该事务。
+以下情况可能导致 broker 中止尚未提交的事务。
 
-- 事务处于打开状态的时间超过了 `transaction.timeout.ms`，例如某次 checkpoint、连续多次失败的 checkpoint 或者作业失败后的重启耗时过长。
-  事务只有在 checkpoint 完成时才会被提交，因此在此之前的 checkpoint 失败期间它一直处于打开状态。
+- 事务处于打开状态的时间超过了 `transaction.timeout.ms`。在启用 checkpoint 的流作业中，checkpoint 耗时过长、checkpoint 连续失败或作业重启耗时过长，都可能导致事务在提交前超时。
+  在批模式下，事务也可能在 writer 处理输入或 committer 等待调度期间超时。
 - 另一个 producer 使用相同的 `transactional.id` 进行了初始化。sink 的事务 ID 格式为 `transactionalIdPrefix-subtask-offset`，
   因此在同一个 Kafka 集群上使用相同 `transactionalIdPrefix` 的另一个 sink 会使用相同的 ID，同一个 subtask 的另一次执行尝试（execution attempt）也是如此。
   同一个 subtask 的两次执行尝试有可能在一段时间内同时运行，例如 TaskManager 与 JobManager 失去连接、但尚未停止其上的 task 时。
@@ -691,14 +692,15 @@ Flink 通过 Kafka 连接器提供了一流的支持，可以对 Kerberos 配置
 
 - 事务是该 task 自本次启动以来自己写入的，并且 sink 的 writer 和 committer 运行在同一个 task 中：task 会失败。
   失败原因为 `Unable to commit transaction '<transactional.id>' because the broker rejected the commit`，并说明除非有其他 producer 已经提交了该事务，否则数据已经丢失。
-  重启之后，sink 会根据恢复的 checkpoint 再尝试提交一次。这次提交同样会被拒绝，但此时只会记录日志，因此同一个事务不会让 task 再次失败。
+  如果作业从包含该事务的 checkpoint 重启，sink 会再次尝试提交。如果 broker 再次以这两种异常之一拒绝提交，sink 会记录错误并继续运行。
 - 事务是从 checkpoint 或 savepoint 中恢复的，或者 committer 没有运行在 writer 所在的 task 中：sink 会记录一条以
   `Unable to commit transaction` 开头的日志，作业继续运行。
 
-在流模式下，除非对 writer 和 committer 禁用了 operator chaining，否则二者运行在同一个 task 中。在批模式下，committer 总是运行在单独的 task 中。
+在流模式下，除非对 writer 和 committer 禁用了 operator chaining，否则二者运行在同一个 task 中。在批模式下，committer 运行在单独的 task 中，并在读完其输入后提交事务。
 
-在这两种情况下，被中止事务中的数据都已经丢失。让 task 失败并不能找回这些数据：包含这些数据的 checkpoint 已经完成，
-重启后的作业会从这些数据之后继续处理，不会再次写入它们。task 失败只是为了保证数据丢失不会被忽略。
+在启用 checkpoint 的流作业中，如果写入或 flush 操作在包含这些记录的 checkpoint 完成前失败，Flink 可以从上一个已完成的 checkpoint 恢复并重新处理这些记录。
+如果事务提交在包含这些记录的 checkpoint 完成后被拒绝，作业从该 checkpoint 或后续 checkpoint 自动恢复时，会从这些记录之后继续读取。
+因此，Kafka 的已提交输出中仍然缺少被中止事务的这些记录。
 
 在 task 会因事务被中止而失败的情况下（即 writer 和 committer 运行在同一个 task 中），此后每当又有事务以这种方式被中止，task 都会再次失败。如果原因一直存在，每次 checkpoint 都可能如此：
 例如 checkpoint 的耗时经常超过 `transaction.timeout.ms`，或者两个作业使用了相同的 `transactionalIdPrefix`。

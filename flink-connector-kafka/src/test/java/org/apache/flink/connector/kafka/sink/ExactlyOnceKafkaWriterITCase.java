@@ -35,16 +35,13 @@ import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.groups.SinkWriterMetricGroup;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.test.junit5.MiniClusterExtension;
-import org.apache.flink.util.ExceptionUtils;
 
 import com.google.common.collect.Iterables;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.common.errors.InterruptException;
 import org.apache.kafka.common.errors.ProducerFencedException;
-import org.apache.kafka.common.errors.RetriableException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -290,7 +287,7 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
     /**
      * Tests that a writer of an earlier attempt does not end the transaction that the writer of a
      * later attempt of the same subtask has pre-committed, when the earlier writer is created only
-     * after the pre-commit. The earlier writer may start or refuse to start; the test accepts both.
+     * after the pre-commit.
      *
      * <p>KNOWN, OPEN DEFECT: this test is expected to fail until writers of different attempts of a
      * subtask can no longer end each other's transactions.
@@ -322,26 +319,9 @@ public class ExactlyOnceKafkaWriterITCase extends KafkaWriterTestBase {
             final KafkaCommittable precommitted = onCheckpointBarrier(laterWriter, 1).f1;
 
             // the earlier attempt is still alive and gets to create its writer only now
-            ExactlyOnceKafkaWriter<Integer> earlierWriter = null;
-            try {
-                try {
-                    earlierWriter = createWriter(sink, createInitContext(earlierAttempt));
-                } catch (Exception e) {
-                    // A writer that notices the later attempt and does not start is fine as well.
-                    // A broker that did not answer in time is not such a refusal: the transaction
-                    // of the later attempt would survive, and the test would pass for no reason.
-                    if (ExceptionUtils.findThrowable(e, RetriableException.class).isPresent()
-                            || ExceptionUtils.findThrowable(e, InterruptException.class)
-                                    .isPresent()) {
-                        throw e;
-                    }
-                    LOG.info("The writer of the earlier attempt did not start.", e);
-                }
+            try (ExactlyOnceKafkaWriter<Integer> earlierWriter =
+                    createWriter(sink, createInitContext(earlierAttempt))) {
                 committer.commit(List.of(new MockCommitRequest<>(precommitted)));
-            } finally {
-                if (earlierWriter != null) {
-                    earlierWriter.close();
-                }
             }
 
             // the broker ends a transaction in the partition after it has answered the producer
